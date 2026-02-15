@@ -2617,14 +2617,19 @@ client.on("interactionCreate", async (interaction) => {
       setUserTimezoneZone(interaction.user.id, zone, interaction.user.tag);
       const pending = pendingTitleByUser.get(interaction.user.id);
       if (pending && Date.now() - pending.ts <= 10 * 60 * 1000) {
-        return interaction.showModal(
-          buildRequestModal(
-            interaction.user.id,
-            { type: "iana", zone },
-            pending.label || pending.value,
-            pending.description || ""
-          )
-        );
+        try {
+          return await interaction.showModal(
+            buildRequestModal(
+              interaction.user.id,
+              { type: "iana", zone },
+              pending.label || pending.value,
+              pending.description || ""
+            )
+          );
+        } catch (e) {
+          if (isUnknownInteractionError(e)) return;
+          throw e;
+        }
       }
       const tzLabel = getTimezoneMenuLabel(zone);
       return interaction.update({
@@ -2752,9 +2757,14 @@ client.on("interactionCreate", async (interaction) => {
         ts: Date.now(),
       });
 
-      await interaction.showModal(
-        buildRequestModal(interaction.user.id, tz, t?.label ?? picked, t?.description ?? "")
-      );
+      try {
+        await interaction.showModal(
+          buildRequestModal(interaction.user.id, tz, t?.label ?? picked, t?.description ?? "")
+        );
+      } catch (e) {
+        if (isUnknownInteractionError(e)) return;
+        throw e;
+      }
       // Reset in background so modal appears with minimum latency.
       setTimeout(async () => {
         try {
