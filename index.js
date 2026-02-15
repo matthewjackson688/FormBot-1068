@@ -2251,6 +2251,10 @@ function isUnknownInteractionError(err) {
   return getDiscordErrorCode(err) === 10062;
 }
 
+function isAlreadyAcknowledgedInteractionError(err) {
+  return getDiscordErrorCode(err) === 40060;
+}
+
 async function postToAppsScript(bodyObj, attempt = 0, opts = {}) {
   const payload = JSON.stringify(bodyObj);
   let res = await fetch(APPS_SCRIPT_URL, {
@@ -2881,7 +2885,12 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (!isConfirm) {
-        await interaction.deferUpdate();
+        try {
+          await interaction.deferUpdate();
+        } catch (e) {
+          if (isUnknownInteractionError(e)) return;
+          if (!isAlreadyAcknowledgedInteractionError(e)) throw e;
+        }
         const updatedComponents = updateRemoveButtonComponents(
           interaction.message.components,
           rowSerial,
