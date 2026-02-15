@@ -3226,9 +3226,11 @@ client.on("interactionCreate", async (interaction) => {
             return buildRequestActionRow(rowSerial, optimisticReservation, "arm", optimisticCompleted, pingUserId, true);
           })();
       let interactionAcked = false;
+      let optimisticApplied = false;
       try {
         await interaction.update({ embeds: [optimisticBase], components: [optimisticRow] });
         interactionAcked = true;
+        optimisticApplied = true;
       } catch (e) {
         if (isUnknownInteractionError(e)) return;
         console.error("Failed to optimistically update done button:", e);
@@ -3274,7 +3276,7 @@ client.on("interactionCreate", async (interaction) => {
 
       const completed = !!json.done;
 
-      if (completed !== optimisticCompleted) {
+      if (!optimisticApplied || completed !== optimisticCompleted) {
         const base = interaction.message.embeds?.[0]
           ? EmbedBuilder.from(interaction.message.embeds[0])
           : new EmbedBuilder().setTitle("📋 Title Request");
