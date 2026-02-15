@@ -716,6 +716,7 @@ const MAX_TIMEOUT_MS = 2_147_483_647; // ~24.8 days
 const timersMessageByChannel = new Map(); // channelId -> { messageId, intervalId }
 const reservationsMessageByChannel = new Map(); // channelId -> { messageId, intervalId }
 const interactionCooldowns = new Map(); // key -> expiresAtMs
+const doneToggleInFlight = new Set(); // rowSerial keys currently toggling done/not done
 const LIVE_MESSAGE_REFRESH_MS = 30_000;
 let startupStickyDelayUntil = 0;
 let lastTimersText = null;
@@ -3202,134 +3203,146 @@ client.on("interactionCreate", async (interaction) => {
       const parts = interaction.customId.split("_");
       const rowSerial = parts[1];
       const pingUserIdFromCustom = parts.length >= 3 ? parts[2] : null;
-
-      const previousEmbeds = interaction.message.embeds;
-      const previousComponents = interaction.message.components;
-      const wasCompleted = getCompletedFromEmbed(interaction.message);
-      const optimisticCompleted = !wasCompleted;
-      const isReminder = isReminderMessage(interaction.message);
-
-      // Optimistic UI update
-      const optimisticBase = interaction.message.embeds?.[0]
-        ? EmbedBuilder.from(interaction.message.embeds[0])
-        : new EmbedBuilder().setTitle("📋 Title Request");
-      if (optimisticCompleted) {
-        optimisticBase.setColor(0x777777).setFooter({ text: "Completed" });
-      } else {
-        optimisticBase.setColor(0x00ff00).setFooter(null);
+      const doneKey = String(rowSerial);
+      if (doneToggleInFlight.has(doneKey)) {
+        return interaction.reply({
+          flags: MessageFlags.Ephemeral,
+          content: "⏳ This request is already updating. Please try again in a moment.",
+        }).catch(() => {});
       }
-      const optimisticRow = isReminder
-        ? buildReminderActionRow(rowSerial, optimisticCompleted, pingUserIdFromCustom || getDiscordUserIdFromEmbed(interaction.message), true)
-        : (() => {
-            const optimisticReservation = getReservationFromEmbed(interaction.message);
-            const pingUserId = pingUserIdFromCustom || getDiscordUserIdFromEmbed(interaction.message);
-            return buildRequestActionRow(rowSerial, optimisticReservation, "arm", optimisticCompleted, pingUserId, true);
-          })();
-      let interactionAcked = false;
-      let optimisticApplied = false;
+      doneToggleInFlight.add(doneKey);
+
       try {
-        await interaction.update({ embeds: [optimisticBase], components: [optimisticRow] });
-        interactionAcked = true;
-        optimisticApplied = true;
-      } catch (e) {
-        if (isUnknownInteractionError(e)) return;
-        console.error("Failed to optimistically update done button:", e);
-        try {
-          await interaction.deferUpdate();
-          interactionAcked = true;
-        } catch (deferErr) {
-          if (isUnknownInteractionError(deferErr)) return;
-        }
-      }
-      if (!interactionAcked) return;
+        const previousEmbeds = interaction.message.embeds;
+        const previousComponents = interaction.message.components;
+        const wasCompleted = getCompletedFromEmbed(interaction.message);
+        const optimisticCompleted = !wasCompleted;
+        const isReminder = isReminderMessage(interaction.message);
 
-      const reminderKey = String(rowSerial);
-      const hadReminder = reminderTimers.has(reminderKey) || reminderMeta.has(reminderKey);
-      const reminderMetaEntry = reminderMeta.get(reminderKey);
-      const reminderFired = !!reminderMetaEntry?.fired;
-
-      // Always cancel timer + clear sheet reminder
-      cancelReminder(rowSerial, true);
-      try {
-        await postToAppsScript({ action: "clear_remind", rowSerial });
-      } catch {}
-
-      // Toggle DONE in sheet
-      let json;
-      try {
-        json = await postToAppsScript({ action: "toggle_done", rowSerial });
-      } catch (e) {
-        console.error("toggle_done fetch error:", e);
-        if (previousEmbeds?.length && previousComponents?.length) {
-          await interaction.message.edit({ embeds: previousEmbeds, components: previousComponents });
-        }
-        return;
-      }
-
-      if (!json?.success) {
-        console.error("toggle_done failed:", json);
-        if (previousEmbeds?.length && previousComponents?.length) {
-          await interaction.message.edit({ embeds: previousEmbeds, components: previousComponents });
-        }
-        return;
-      }
-
-      const completed = !!json.done;
-
-      if (!optimisticApplied || completed !== optimisticCompleted) {
-        const base = interaction.message.embeds?.[0]
+        // Optimistic UI update
+        const optimisticBase = interaction.message.embeds?.[0]
           ? EmbedBuilder.from(interaction.message.embeds[0])
           : new EmbedBuilder().setTitle("📋 Title Request");
-
-        if (completed) {
-          base.setColor(0x777777).setFooter({ text: "Completed" });
+        if (optimisticCompleted) {
+          optimisticBase.setColor(0x777777).setFooter({ text: "Completed" });
         } else {
-          base.setColor(0x00ff00).setFooter(null);
+          optimisticBase.setColor(0x00ff00).setFooter(null);
         }
-
-        const row = isReminder
-          ? buildReminderActionRow(rowSerial, completed, pingUserIdFromCustom || getDiscordUserIdFromEmbed(interaction.message), true)
+        const optimisticRow = isReminder
+          ? buildReminderActionRow(rowSerial, optimisticCompleted, pingUserIdFromCustom || getDiscordUserIdFromEmbed(interaction.message), true)
           : (() => {
-              const reservationStr = getReservationFromEmbed(interaction.message);
+              const optimisticReservation = getReservationFromEmbed(interaction.message);
               const pingUserId = pingUserIdFromCustom || getDiscordUserIdFromEmbed(interaction.message);
-              return buildRequestActionRow(rowSerial, reservationStr, "arm", completed, pingUserId, true);
+              return buildRequestActionRow(rowSerial, optimisticReservation, "arm", optimisticCompleted, pingUserId, true);
             })();
+        let interactionAcked = false;
+        let optimisticApplied = false;
+        try {
+          await interaction.update({ embeds: [optimisticBase], components: [optimisticRow] });
+          interactionAcked = true;
+          optimisticApplied = true;
+        } catch (e) {
+          if (isUnknownInteractionError(e)) return;
+          console.error("Failed to optimistically update done button:", e);
+          try {
+            await interaction.deferUpdate();
+            interactionAcked = true;
+          } catch (deferErr) {
+            if (isUnknownInteractionError(deferErr)) return;
+          }
+        }
+        if (!interactionAcked) return;
 
-        await interaction.message.edit({ embeds: [base], components: [row] });
-      }
+        const reminderKey = String(rowSerial);
+        const hadReminder = reminderTimers.has(reminderKey) || reminderMeta.has(reminderKey);
+        const reminderMetaEntry = reminderMeta.get(reminderKey);
+        const reminderFired = !!reminderMetaEntry?.fired;
 
-      // Update embed visuals
-      if (completed && hadReminder && !reminderFired && !isReminder) {
-        await interaction.followUp({
-          flags: MessageFlags.Ephemeral,
-          content: "✅ Reminder cancelled because this request was marked done.",
+        // Always cancel timer + clear sheet reminder
+        cancelReminder(rowSerial, true);
+        try {
+          await postToAppsScript({ action: "clear_remind", rowSerial });
+        } catch {}
+
+        // Toggle DONE in sheet
+        let json;
+        try {
+          json = await postToAppsScript({ action: "toggle_done", rowSerial });
+        } catch (e) {
+          console.error("toggle_done fetch error:", e);
+          if (previousEmbeds?.length && previousComponents?.length) {
+            await interaction.message.edit({ embeds: previousEmbeds, components: previousComponents });
+          }
+          return;
+        }
+
+        if (!json?.success) {
+          console.error("toggle_done failed:", json);
+          if (previousEmbeds?.length && previousComponents?.length) {
+            await interaction.message.edit({ embeds: previousEmbeds, components: previousComponents });
+          }
+          return;
+        }
+
+        const completed = !!json.done;
+
+        if (!optimisticApplied || completed !== optimisticCompleted) {
+          const base = interaction.message.embeds?.[0]
+            ? EmbedBuilder.from(interaction.message.embeds[0])
+            : new EmbedBuilder().setTitle("📋 Title Request");
+
+          if (completed) {
+            base.setColor(0x777777).setFooter({ text: "Completed" });
+          } else {
+            base.setColor(0x00ff00).setFooter(null);
+          }
+
+          const row = isReminder
+            ? buildReminderActionRow(rowSerial, completed, pingUserIdFromCustom || getDiscordUserIdFromEmbed(interaction.message), true)
+            : (() => {
+                const reservationStr = getReservationFromEmbed(interaction.message);
+                const pingUserId = pingUserIdFromCustom || getDiscordUserIdFromEmbed(interaction.message);
+                return buildRequestActionRow(rowSerial, reservationStr, "arm", completed, pingUserId, true);
+              })();
+
+          await interaction.message.edit({ embeds: [base], components: [row] });
+        }
+
+        // Update embed visuals
+        if (completed && hadReminder && !reminderFired && !isReminder) {
+          await interaction.followUp({
+            flags: MessageFlags.Ephemeral,
+            content: "✅ Reminder cancelled because this request was marked done.",
+          });
+        }
+
+        if (isReminder) {
+          try {
+            await updateOriginalRequestFromReminder(client, interaction.message, rowSerial, completed);
+          } catch (e) {
+            console.error("Failed to sync original request from reminder:", e);
+          }
+        } else {
+          try {
+            await updateReminderMessagePingVisibility(client, rowSerial, completed, completed);
+          } catch (e) {
+            console.error("Failed to sync reminder from original request:", e);
+          }
+        }
+
+        // Immediate timers refresh for all active timers messages
+        updateAllTimersMessages(client);
+        updateAllReservationsMessages(client);
+        auditLog("done_toggle", {
+          userId: interaction.user.id,
+          rowSerial,
+          completed,
+          guildId: interaction.guildId,
+          channelId: interaction.channelId,
         });
+      } finally {
+        doneToggleInFlight.delete(doneKey);
       }
-
-      if (isReminder) {
-        try {
-          await updateOriginalRequestFromReminder(client, interaction.message, rowSerial, completed);
-        } catch (e) {
-          console.error("Failed to sync original request from reminder:", e);
-        }
-      } else {
-        try {
-          await updateReminderMessagePingVisibility(client, rowSerial, completed, completed);
-        } catch (e) {
-          console.error("Failed to sync reminder from original request:", e);
-        }
-      }
-
-      // Immediate timers refresh for all active timers messages
-      updateAllTimersMessages(client);
-      updateAllReservationsMessages(client);
-      auditLog("done_toggle", {
-        userId: interaction.user.id,
-        rowSerial,
-        completed,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-      });
     }
   } catch (err) {
     console.error("Unhandled interaction error:", err);
