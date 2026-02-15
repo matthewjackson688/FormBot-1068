@@ -2247,6 +2247,10 @@ function getDiscordErrorCode(err) {
   return Number.isFinite(n) ? n : null;
 }
 
+function isUnknownInteractionError(err) {
+  return getDiscordErrorCode(err) === 10062;
+}
+
 async function postToAppsScript(bodyObj, attempt = 0, opts = {}) {
   const payload = JSON.stringify(bodyObj);
   let res = await fetch(APPS_SCRIPT_URL, {
@@ -2723,7 +2727,12 @@ client.on("interactionCreate", async (interaction) => {
 
     // modal submit -> submit -> post in FORM channel
     if (interaction.isModalSubmit() && interaction.customId === "title_request_modal") {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      try {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      } catch (e) {
+        if (isUnknownInteractionError(e)) return;
+        throw e;
+      }
 
       const pending = pendingTitleByUser.get(interaction.user.id);
       if (!pending || Date.now() - pending.ts > 10 * 60 * 1000) {
@@ -3169,14 +3178,21 @@ client.on("interactionCreate", async (interaction) => {
             const pingUserId = pingUserIdFromCustom || getDiscordUserIdFromEmbed(interaction.message);
             return buildRequestActionRow(rowSerial, optimisticReservation, "arm", optimisticCompleted, pingUserId, true);
           })();
+      let interactionAcked = false;
       try {
         await interaction.update({ embeds: [optimisticBase], components: [optimisticRow] });
+        interactionAcked = true;
       } catch (e) {
+        if (isUnknownInteractionError(e)) return;
         console.error("Failed to optimistically update done button:", e);
         try {
           await interaction.deferUpdate();
-        } catch {}
+          interactionAcked = true;
+        } catch (deferErr) {
+          if (isUnknownInteractionError(deferErr)) return;
+        }
       }
+      if (!interactionAcked) return;
 
       const reminderKey = String(rowSerial);
       const hadReminder = reminderTimers.has(reminderKey) || reminderMeta.has(reminderKey);
