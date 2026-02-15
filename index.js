@@ -790,24 +790,14 @@ function startTimersInterval(client, channelId, messageId) {
         ? (e.code ?? e.rawError?.code ?? null)
         : null;
       const code = Number(rawCode);
-      // Message missing: recreate a fresh timers message in the same channel.
+      // Message missing: stop tracking instead of auto-recreating.
       if (code === 10008) {
-        try {
-          const ch = await client.channels.fetch(channelId);
-          if (ch?.isTextBased()) {
-            const replacement = await ch.send(updated);
-            const newIntervalId = startTimersInterval(client, channelId, replacement.id);
-            timersMessageByChannel.set(channelId, { messageId: replacement.id, intervalId: newIntervalId });
-            persistTimersStore();
-          }
-        } catch (recreateErr) {
-          console.error("timers message recreate failed:", recreateErr);
-          const entry = timersMessageByChannel.get(channelId);
-          if (entry?.messageId === messageId) {
-            timersMessageByChannel.delete(channelId);
-            persistTimersStore();
-          }
+        const entry = timersMessageByChannel.get(channelId);
+        if (entry?.messageId === messageId) {
+          timersMessageByChannel.delete(channelId);
+          persistTimersStore();
         }
+        console.log(`⚠️ Tracked /timers message missing in ${channelId}; auto-recreate disabled.`);
         clearInterval(intervalId);
         return;
       }
@@ -2138,7 +2128,7 @@ function buildRequestActionRow(
 // =====================
 // PANEL ENSURE
 // =====================
-async function ensurePanel(client) {
+async function ensurePanel(client, { allowCreate = true } = {}) {
   const payload = buildPanelPayload();
   for (const panelChannelId of TARGET_PANEL_CHANNEL_IDS) {
     const panelChannel = await client.channels.fetch(panelChannelId);
@@ -2157,8 +2147,17 @@ async function ensurePanel(client) {
           continue;
         }
       } catch {
+        if (!allowCreate) {
+          console.log(`⚠️ Panel message missing/uneditable (${panelChannelId}); auto-create disabled.`);
+          continue;
+        }
         // fall through and recreate
       }
+    }
+
+    if (!allowCreate) {
+      console.log(`⚠️ No stored panel message for channel (${panelChannelId}); auto-create disabled.`);
+      continue;
     }
 
     const msg = await panelChannel.send(payload);
@@ -2384,7 +2383,7 @@ client.once("clientReady", async () => {
   scheduleHourlyRestart();
   await runStartupChecks(client);
   try {
-    await ensurePanel(client);
+    await ensurePanel(client, { allowCreate: false });
   } catch (e) {
     console.error("❌ ensurePanel failed:", e);
   }
