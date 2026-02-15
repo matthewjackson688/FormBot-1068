@@ -853,6 +853,21 @@ async function findExistingReservationsMessage(channel, client) {
   );
 }
 
+function isPanelMessage(msg, client) {
+  if (!msg || msg.author?.id !== client?.user?.id) return false;
+  const hasPanelTitle = Array.isArray(msg.embeds) && msg.embeds.some((e) => e?.title === "Title Requests");
+  if (!hasPanelTitle) return false;
+  return Array.isArray(msg.components) && msg.components.some((row) =>
+    Array.isArray(row?.components) && row.components.some((component) => component?.customId === "select_title")
+  );
+}
+
+async function findPanelMessages(channel, client) {
+  if (!channel?.isTextBased()) return [];
+  const msgs = await channel.messages.fetch({ limit: 50 });
+  return msgs.filter((m) => isPanelMessage(m, client)).map((m) => m);
+}
+
 function startReservationsInterval(client, channelId, messageId) {
   let inFlight = false;
   let lastBottomCheckAt = 0;
@@ -1224,7 +1239,7 @@ async function fetchTimersText() {
   const formatRemaining = (title) => {
     const possible = nextPossibleByTitle.get(title);
     if (possible && Number.isFinite(possible.secondsUntil)) {
-      if (possible.secondsUntil <= 0) return "Available";
+      if (possible.secondsUntil <= 59) return "Available";
       const mmTotal = Math.floor(possible.secondsUntil / 60);
       const hh = Math.floor(mmTotal / 60);
       const mm = mmTotal % 60;
@@ -1235,7 +1250,7 @@ async function fetchTimersText() {
     const elapsedSeconds = byTitle.get(title);
     if (!Number.isFinite(elapsedSeconds)) return "Available";
     const remaining = 3600 - elapsedSeconds;
-    if (remaining <= 0) return "Available";
+    if (remaining <= 59) return "Available";
     const mm = Math.floor(remaining / 60);
     return `${mm}m`;
   };
@@ -1243,7 +1258,7 @@ async function fetchTimersText() {
     const hasUpcomingReservation = nextByTitle.has(title);
     const cooldownSeconds = Number(activeCooldownByTitle.get(title));
     const hasActiveCooldown = Number.isFinite(cooldownSeconds) && cooldownSeconds > 0;
-    if (!hasUpcomingReservation && !hasActiveCooldown) return "No reservation";
+    if (!hasUpcomingReservation && !hasActiveCooldown) return "Any time/date";
     if (!next || !Number.isFinite(next.secondsUntil) || !next.reservationUtc) return "Unknown";
     const res = next.reservationUtc;
     const match = res.match(/^(\d{2}):(\d{2})\s+(\d{2})\/(\d{2})\/(\d{4})$/);
@@ -2128,7 +2143,7 @@ function buildRequestActionRow(
 // =====================
 // PANEL ENSURE
 // =====================
-async function ensurePanel(client, { allowCreate = true } = {}) {
+async function ensurePanel(client, { allowCreate = true, cleanupExtra = false } = {}) {
   const payload = buildPanelPayload();
   for (const panelChannelId of TARGET_PANEL_CHANNEL_IDS) {
     const panelChannel = await client.channels.fetch(panelChannelId);
@@ -2143,6 +2158,15 @@ async function ensurePanel(client, { allowCreate = true } = {}) {
         if (ch?.isTextBased()) {
           const msg = await ch.messages.fetch(messageId);
           await msg.edit(payload);
+          if (cleanupExtra) {
+            try {
+              const panelMessages = await findPanelMessages(panelChannel, client);
+              for (const extra of panelMessages) {
+                if (extra.id === msg.id) continue;
+                await extra.delete().catch(() => {});
+              }
+            } catch {}
+          }
           console.log(`✅ Panel message updated (${panelChannelId})`);
           continue;
         }
@@ -2157,6 +2181,21 @@ async function ensurePanel(client, { allowCreate = true } = {}) {
 
     if (!allowCreate) {
       console.log(`⚠️ No stored panel message for channel (${panelChannelId}); auto-create disabled.`);
+      continue;
+    }
+
+    const existingPanels = await findPanelMessages(panelChannel, client).catch(() => []);
+    if (existingPanels.length > 0) {
+      const msg = existingPanels[0];
+      await msg.edit(payload).catch(() => {});
+      setPanelMessageRef(panelChannel.id, msg.id);
+      if (cleanupExtra) {
+        for (const extra of existingPanels) {
+          if (extra.id === msg.id) continue;
+          await extra.delete().catch(() => {});
+        }
+      }
+      console.log(`✅ Panel message relinked (${panelChannelId})`);
       continue;
     }
 
@@ -2479,13 +2518,12 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ flags: MessageFlags.Ephemeral, content: "❌ You need Administrator to use this." });
       }
 
-      clearPanelMessageId();
       try {
-        await ensurePanel(client);
-        return interaction.reply({ flags: MessageFlags.Ephemeral, content: "✅ Panel reset and recreated/updated." });
+        await ensurePanel(client, { cleanupExtra: true });
+        return interaction.reply({ flags: MessageFlags.Ephemeral, content: "✅ Panel synced (duplicates cleaned where found)." });
       } catch (e) {
         console.error("panel-reset ensurePanel failed:", e);
-        return interaction.reply({ flags: MessageFlags.Ephemeral, content: "✅ Panel id cleared, but recreate failed (check logs)." });
+        return interaction.reply({ flags: MessageFlags.Ephemeral, content: "❌ Panel sync failed (check logs)." });
       }
     }
 
