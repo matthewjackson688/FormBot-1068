@@ -3368,3 +3368,4 @@ client.on("error", (err) => console.error("Discord client error:", err));
 process.on("unhandledRejection", (reason) => console.error("Unhandled promise rejection:", reason));
 
 client.login(DISCORD_TOKEN);
+
