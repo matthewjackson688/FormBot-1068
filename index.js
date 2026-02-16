@@ -1160,12 +1160,8 @@ function startReservationsInterval(client, channelId, messageId) {
         } catch {}
       }
       if (shouldRepostAtBottom) {
-        let replacement = await findExistingReservationsMessage(ch, client);
-        if (replacement) {
-          await replacement.edit(updated).catch(() => {});
-        } else {
-          replacement = await ch.send(updated);
-        }
+        // Always send a fresh message at bottom first to avoid delete->recreate gaps.
+        const replacement = await ch.send(updated);
         try {
           const old = await ch.messages.fetch(messageId);
           await old.delete().catch(() => {});
