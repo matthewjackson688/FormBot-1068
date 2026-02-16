@@ -67,6 +67,8 @@ const {
   BLOCK_BOOLEAN,
   HOURLY_RESTART,
   BUTTON_LOGGER,
+  PERF_LOGGER,
+  PERF_SLOW_MS,
 } = process.env;
 
 function parseCsvIds(input) {
@@ -111,7 +113,14 @@ const RESERVATION_OWNER_STORE_PATH = path.join(__dirname, "reservation-owners.js
 const RESERVATION_MESSAGE_STORE_PATH = path.join(__dirname, "reservation-messages.json");
 const AUDIT_LOG_PATH = path.join(__dirname, "audit.log");
 const BUTTON_LOG_PATH = path.join(__dirname, "button-logs.ndjson");
+const PERF_LOG_PATH = path.join(__dirname, "perf.log");
 const TIMERS_CACHE_MAX_AGE_MS = 60_000;
+const FILE_WRITE_DEBOUNCE_MS = 250;
+const LOG_WRITE_DEBOUNCE_MS = 250;
+const PERF_LOGGER_ENABLED = String(PERF_LOGGER ?? "1").trim() === "1";
+const PERF_SLOW_THRESHOLD_MS = Math.max(0, Number(PERF_SLOW_MS ?? "200") || 0);
+const CONTENT_VERIFY_INTERVAL_MS = 5 * 60_000;
+const BUTTON_INTERACTION_TTL_MS = 2 * 60_000;
 
 function readJsonSafe(filepath, fallback = {}) {
   try {
@@ -124,32 +133,152 @@ function readJsonSafe(filepath, fallback = {}) {
     return fallback;
   }
 }
+const bufferedJsonWrites = new Map(); // filepath -> { data, timer, inFlight, dirty }
+const bufferedLogWrites = new Map(); // filepath -> { chunks, timer, inFlight }
+const processedButtonInteractionIds = new Map(); // interactionId -> expiresAtMs
+
+function flushJsonWrite(filepath) {
+  const state = bufferedJsonWrites.get(filepath);
+  if (!state || !state.dirty || state.inFlight) return;
+  state.inFlight = true;
+  state.dirty = false;
+  const payload = JSON.stringify(state.data, null, 2);
+
+  fs.promises.writeFile(filepath, payload, "utf8")
+    .catch(() => {})
+    .finally(() => {
+      state.inFlight = false;
+      if (state.dirty && !state.timer) {
+        state.timer = setTimeout(() => {
+          state.timer = null;
+          flushJsonWrite(filepath);
+        }, FILE_WRITE_DEBOUNCE_MS);
+      }
+    });
+}
+
+function scheduleJsonWrite(filepath, data, debounceMs = FILE_WRITE_DEBOUNCE_MS) {
+  const state = bufferedJsonWrites.get(filepath) || { data: null, timer: null, inFlight: false, dirty: false };
+  state.data = data;
+  state.dirty = true;
+  if (state.timer) clearTimeout(state.timer);
+  state.timer = setTimeout(() => {
+    state.timer = null;
+    flushJsonWrite(filepath);
+  }, debounceMs);
+  bufferedJsonWrites.set(filepath, state);
+}
+
 function writeJsonSafe(filepath, data) {
-  fs.writeFileSync(filepath, JSON.stringify(data, null, 2), "utf8");
+  scheduleJsonWrite(filepath, data);
+}
+
+function flushLogWrite(filepath) {
+  const state = bufferedLogWrites.get(filepath);
+  if (!state || state.inFlight || state.chunks.length === 0) return;
+  state.inFlight = true;
+  const payload = state.chunks.join("");
+  state.chunks = [];
+
+  fs.promises.appendFile(filepath, payload, "utf8")
+    .catch(() => {})
+    .finally(() => {
+      state.inFlight = false;
+      if (state.chunks.length > 0 && !state.timer) {
+        state.timer = setTimeout(() => {
+          state.timer = null;
+          flushLogWrite(filepath);
+        }, LOG_WRITE_DEBOUNCE_MS);
+      }
+    });
+}
+
+function appendLineBuffered(filepath, line, debounceMs = LOG_WRITE_DEBOUNCE_MS) {
+  const state = bufferedLogWrites.get(filepath) || { chunks: [], timer: null, inFlight: false };
+  state.chunks.push(line);
+  if (!state.timer) {
+    state.timer = setTimeout(() => {
+      state.timer = null;
+      flushLogWrite(filepath);
+    }, debounceMs);
+  }
+  bufferedLogWrites.set(filepath, state);
+}
+
+function flushAllBufferedWritesSync() {
+  for (const [filepath, state] of bufferedJsonWrites.entries()) {
+    if (!state?.dirty) continue;
+    try {
+      fs.writeFileSync(filepath, JSON.stringify(state.data, null, 2), "utf8");
+      state.dirty = false;
+    } catch {}
+  }
+  for (const [filepath, state] of bufferedLogWrites.entries()) {
+    if (!state?.chunks?.length) continue;
+    try {
+      fs.appendFileSync(filepath, state.chunks.join(""), "utf8");
+      state.chunks = [];
+    } catch {}
+  }
+}
+
+process.on("exit", flushAllBufferedWritesSync);
+
+function perfLog(event, data = {}) {
+  if (!PERF_LOGGER_ENABLED) return;
+  try {
+    appendLineBuffered(PERF_LOG_PATH, `${JSON.stringify({ ts: new Date().toISOString(), event, ...data })}\n`);
+  } catch {}
+}
+
+function perfDuration(event, startedAtMs, data = {}, force = false) {
+  const durationMs = Date.now() - startedAtMs;
+  if (force || durationMs >= PERF_SLOW_THRESHOLD_MS) {
+    perfLog(event, { durationMs, ...data });
+  }
+  return durationMs;
+}
+
+function pruneProcessedButtonInteractions(nowMs = Date.now()) {
+  for (const [interactionId, expiresAt] of processedButtonInteractionIds.entries()) {
+    if (expiresAt <= nowMs) processedButtonInteractionIds.delete(interactionId);
+  }
+}
+
+function isDuplicateButtonInteraction(interactionId) {
+  if (!interactionId) return false;
+  const now = Date.now();
+  if (processedButtonInteractionIds.size >= 1024) {
+    pruneProcessedButtonInteractions(now);
+  }
+  const expiresAt = processedButtonInteractionIds.get(interactionId) || 0;
+  if (expiresAt > now) return true;
+  processedButtonInteractionIds.set(interactionId, now + BUTTON_INTERACTION_TTL_MS);
+  return false;
 }
 
 function auditLog(event, data = {}) {
   try {
     const line = JSON.stringify({ ts: new Date().toISOString(), event, ...data });
-    fs.appendFileSync(AUDIT_LOG_PATH, `${line}\n`, "utf8");
+    appendLineBuffered(AUDIT_LOG_PATH, `${line}\n`);
   } catch {}
 }
 
 function appendButtonLog(entry) {
   if (!BUTTON_LOGGER_ENABLED) return;
   try {
-    // Fire-and-forget append to avoid blocking the interaction ack path.
-    const line = `${JSON.stringify(entry)}\n`;
-    fs.appendFile(BUTTON_LOG_PATH, line, "utf8", () => {});
+    appendLineBuffered(BUTTON_LOG_PATH, `${JSON.stringify(entry)}\n`);
   } catch {}
 }
 
 // ---- Panel store
+let panelStoreCache = readJsonSafe(PANEL_STORE_PATH, {});
 function readPanelStore() {
-  return readJsonSafe(PANEL_STORE_PATH, {});
+  return panelStoreCache && typeof panelStoreCache === "object" ? panelStoreCache : {};
 }
 function writePanelStore(data) {
-  writeJsonSafe(PANEL_STORE_PATH, data);
+  panelStoreCache = data && typeof data === "object" ? data : {};
+  writeJsonSafe(PANEL_STORE_PATH, panelStoreCache);
 }
 function clearPanelMessageId() {
   writePanelStore({ byChannel: {} });
@@ -739,12 +868,12 @@ const reservationsStore = readJsonSafe(RESERVATIONS_STORE_PATH, {});
 
 for (const [channelId, messageId] of Object.entries(timersStore)) {
   if (channelId && messageId) {
-    timersMessageByChannel.set(channelId, { messageId, intervalId: null });
+    timersMessageByChannel.set(channelId, { messageId, intervalId: null, lastRenderedContent: null, lastVerifiedAt: 0 });
   }
 }
 for (const [channelId, messageId] of Object.entries(reservationsStore)) {
   if (channelId && messageId) {
-    reservationsMessageByChannel.set(channelId, { messageId, intervalId: null });
+    reservationsMessageByChannel.set(channelId, { messageId, intervalId: null, lastRenderedContent: null, lastVerifiedAt: 0 });
   }
 }
 
@@ -771,21 +900,62 @@ function setTimersBackoff(isRateLimited = false) {
   timersNextFetchAttemptAt = Date.now() + backoffMs;
 }
 
+async function getTextBasedChannel(client, channelId) {
+  const key = String(channelId);
+  const cached = client.channels.cache.get(key);
+  if (cached?.isTextBased()) return cached;
+  const fetched = await client.channels.fetch(key);
+  return fetched?.isTextBased() ? fetched : null;
+}
+
+async function getChannelMessage(channel, messageId) {
+  const key = String(messageId);
+  const cached = channel.messages?.cache?.get(key);
+  if (cached) return cached;
+  return channel.messages.fetch(key);
+}
+
+function shouldSkipRenderedUpdate(entry, nextContent) {
+  if (!entry) return false;
+  if (entry.lastRenderedContent !== nextContent) return false;
+  const lastVerifiedAt = Number(entry.lastVerifiedAt || 0);
+  return Date.now() - lastVerifiedAt < CONTENT_VERIFY_INTERVAL_MS;
+}
+
+function markRenderedUpdate(entry, content) {
+  if (!entry) return;
+  entry.lastRenderedContent = content;
+  entry.lastVerifiedAt = Date.now();
+}
+
 function startTimersInterval(client, channelId, messageId) {
   let inFlight = false;
   const tick = async () => {
     if (inFlight) return;
+    const tickStartedAt = Date.now();
+    let hadSnapshot = false;
+    let skipReason = null;
     inFlight = true;
-    const updated = await fetchTimersText();
-    if (!updated) {
-      inFlight = false;
-      return;
-    }
     try {
-      const ch = await client.channels.fetch(channelId);
+      const updated = await fetchTimersText();
+      hadSnapshot = !!updated;
+      if (!updated) return;
+
+      const entry = timersMessageByChannel.get(channelId);
+      if (entry?.messageId === messageId && shouldSkipRenderedUpdate(entry, updated)) {
+        skipReason = "content_unchanged";
+        return;
+      }
+
+      const ch = await getTextBasedChannel(client, channelId);
       if (!ch?.isTextBased()) return;
-      const msg = await ch.messages.fetch(messageId);
+      const msg = await getChannelMessage(ch, messageId);
+      const editStartedAt = Date.now();
       await msg.edit(updated);
+      perfDuration("discord_message_edit", editStartedAt, { scope: "timers", channelId, messageId });
+      if (entry?.messageId === messageId) {
+        markRenderedUpdate(entry, updated);
+      }
     } catch (e) {
       const rawCode = e && typeof e === "object"
         ? (e.code ?? e.rawError?.code ?? null)
@@ -815,6 +985,13 @@ function startTimersInterval(client, channelId, messageId) {
       console.error("timers update failed:", e);
     } finally {
       inFlight = false;
+      perfDuration("timers_tick", tickStartedAt, {
+        channelId,
+        messageId,
+        hadSnapshot,
+        skipped: !!skipReason,
+        skipReason,
+      });
     }
   };
 
@@ -875,14 +1052,17 @@ function startReservationsInterval(client, channelId, messageId) {
   const BOTTOM_CHECK_MS = 3000;
   const tick = async () => {
     if (inFlight) return;
+    const tickStartedAt = Date.now();
+    let updated = null;
+    let hadSnapshot = false;
+    let skipReason = null;
     inFlight = true;
-    const updated = await fetchReservationsText();
-    if (!updated) {
-      inFlight = false;
-      return;
-    }
     try {
-      const ch = await client.channels.fetch(channelId);
+      updated = await fetchReservationsText();
+      hadSnapshot = !!updated;
+      if (!updated) return;
+
+      const ch = await getTextBasedChannel(client, channelId);
       if (!ch?.isTextBased()) return;
       let shouldRepostAtBottom = false;
       if (Date.now() >= startupStickyDelayUntil && Date.now() - lastBottomCheckAt >= BOTTOM_CHECK_MS) {
@@ -905,13 +1085,29 @@ function startReservationsInterval(client, channelId, messageId) {
           await old.delete().catch(() => {});
         } catch {}
         const newIntervalId = startReservationsInterval(client, channelId, replacement.id);
-        reservationsMessageByChannel.set(channelId, { messageId: replacement.id, intervalId: newIntervalId });
+        reservationsMessageByChannel.set(channelId, {
+          messageId: replacement.id,
+          intervalId: newIntervalId,
+          lastRenderedContent: updated,
+          lastVerifiedAt: Date.now(),
+        });
         persistReservationsStore();
         clearInterval(intervalId);
         return;
       }
-      const msg = await ch.messages.fetch(messageId);
+      const entry = reservationsMessageByChannel.get(channelId);
+      if (entry?.messageId === messageId && shouldSkipRenderedUpdate(entry, updated)) {
+        skipReason = "content_unchanged";
+        return;
+      }
+
+      const msg = await getChannelMessage(ch, messageId);
+      const editStartedAt = Date.now();
       await msg.edit(updated);
+      perfDuration("discord_message_edit", editStartedAt, { scope: "reservations", channelId, messageId });
+      if (entry?.messageId === messageId) {
+        markRenderedUpdate(entry, updated);
+      }
     } catch (e) {
       const rawCode = e && typeof e === "object"
         ? (e.code ?? e.rawError?.code ?? null)
@@ -919,7 +1115,7 @@ function startReservationsInterval(client, channelId, messageId) {
       const code = Number(rawCode);
       if (code === 10008) {
         try {
-          const ch = await client.channels.fetch(channelId);
+          const ch = await getTextBasedChannel(client, channelId);
           if (ch?.isTextBased()) {
             let replacement = await findExistingReservationsMessage(ch, client);
             if (replacement) {
@@ -928,7 +1124,12 @@ function startReservationsInterval(client, channelId, messageId) {
               replacement = await ch.send(updated);
             }
             const newIntervalId = startReservationsInterval(client, channelId, replacement.id);
-            reservationsMessageByChannel.set(channelId, { messageId: replacement.id, intervalId: newIntervalId });
+            reservationsMessageByChannel.set(channelId, {
+              messageId: replacement.id,
+              intervalId: newIntervalId,
+              lastRenderedContent: updated,
+              lastVerifiedAt: Date.now(),
+            });
             persistReservationsStore();
           }
         } catch (recreateErr) {
@@ -954,6 +1155,13 @@ function startReservationsInterval(client, channelId, messageId) {
       console.error("reservations update failed:", e);
     } finally {
       inFlight = false;
+      perfDuration("reservations_tick", tickStartedAt, {
+        channelId,
+        messageId,
+        hadSnapshot,
+        skipped: !!skipReason,
+        skipReason,
+      });
     }
   };
 
@@ -998,6 +1206,7 @@ function parseDoneTimeMs(value) {
 }
 
 async function fetchTimersSnapshotFromSheetDb() {
+  const startedAt = Date.now();
   if (!SHEETDB_URL) {
     throw new Error("SHEETDB_URL not configured");
   }
@@ -1130,6 +1339,7 @@ async function fetchTimersSnapshotFromSheetDb() {
     };
   });
 
+  perfDuration("sheetdb_snapshot_fetch", startedAt, { status: res.status, rowCount: rows.length });
   return { success: true, timers, nextReservations, nextPossibleReservations, activeCooldowns, activeSerials, rowStates };
 }
 
@@ -1331,12 +1541,16 @@ async function updateTimersMessage(client, channelId) {
 
   const text = await fetchTimersText();
   if (!text) return;
+  if (shouldSkipRenderedUpdate(entry, text)) return;
 
   try {
-    const ch = await client.channels.fetch(channelId);
+    const ch = await getTextBasedChannel(client, channelId);
     if (!ch?.isTextBased()) return;
-    const msg = await ch.messages.fetch(entry.messageId);
+    const msg = await getChannelMessage(ch, entry.messageId);
+    const editStartedAt = Date.now();
     await msg.edit(text);
+    perfDuration("discord_message_edit", editStartedAt, { scope: "timers_immediate", channelId, messageId: entry.messageId });
+    markRenderedUpdate(entry, text);
   } catch (e) {
     console.error("timers immediate update failed:", e);
   }
@@ -1350,11 +1564,15 @@ async function updateAllTimersMessages(client) {
   await Promise.all(
     Array.from(timersMessageByChannel.entries()).map(async ([channelId, entry]) => {
       if (!entry?.messageId) return;
+      if (shouldSkipRenderedUpdate(entry, text)) return;
       try {
-        const ch = await client.channels.fetch(channelId);
+        const ch = await getTextBasedChannel(client, channelId);
         if (!ch?.isTextBased()) return;
-        const msg = await ch.messages.fetch(entry.messageId);
+        const msg = await getChannelMessage(ch, entry.messageId);
+        const editStartedAt = Date.now();
         await msg.edit(text);
+        perfDuration("discord_message_edit", editStartedAt, { scope: "timers_bulk", channelId, messageId: entry.messageId });
+        markRenderedUpdate(entry, text);
       } catch (e) {
         const code = getDiscordErrorCode(e);
         if (code === 10008 || code === 10003) {
@@ -1377,11 +1595,15 @@ async function updateAllReservationsMessages(client) {
   await Promise.all(
     Array.from(reservationsMessageByChannel.entries()).map(async ([channelId, entry]) => {
       if (!entry?.messageId) return;
+      if (shouldSkipRenderedUpdate(entry, text)) return;
       try {
-        const ch = await client.channels.fetch(channelId);
+        const ch = await getTextBasedChannel(client, channelId);
         if (!ch?.isTextBased()) return;
-        const msg = await ch.messages.fetch(entry.messageId);
+        const msg = await getChannelMessage(ch, entry.messageId);
+        const editStartedAt = Date.now();
         await msg.edit(text);
+        perfDuration("discord_message_edit", editStartedAt, { scope: "reservations_bulk", channelId, messageId: entry.messageId });
+        markRenderedUpdate(entry, text);
       } catch (e) {
         const code = getDiscordErrorCode(e);
         if (code === 10008 || code === 10003) {
@@ -2303,76 +2525,120 @@ function isAlreadyAcknowledgedInteractionError(err) {
 }
 
 async function postToAppsScript(bodyObj, attempt = 0, opts = {}) {
+  const startedAt = Date.now();
+  const action = (bodyObj && typeof bodyObj === "object")
+    ? (bodyObj.action || (bodyObj.namedValues ? "submit_named_values" : "submit"))
+    : "unknown";
   const payload = JSON.stringify(bodyObj);
-  let res = await fetch(APPS_SCRIPT_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: payload,
-    redirect: "follow",
-  });
-  const text = await res.text();
-  let json;
   try {
-    json = JSON.parse(text);
-  } catch (e) {
-    // Google Apps Script sometimes returns an HTML "Moved Temporarily" page with a one-time googleusercontent URL.
-    const movedHrefMatch = text.match(/<A HREF="([^"]+)">here<\/A>/i);
-    if (attempt < 2 && movedHrefMatch && movedHrefMatch[1]) {
-      const movedUrl = movedHrefMatch[1].replace(/&amp;/g, "&");
-      try {
-        const movedRes = await fetch(movedUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: payload,
-          redirect: "follow",
-        });
-        const movedText = await movedRes.text();
-        const movedJson = JSON.parse(movedText);
-        appsScriptLastOkAt = Date.now();
-        appsScriptLastError = "";
-        return movedJson;
-      } catch {}
-    }
+    const res = await fetch(APPS_SCRIPT_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload,
+      redirect: "follow",
+    });
+    const text = await res.text();
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch (e) {
+      // Google Apps Script sometimes returns an HTML "Moved Temporarily" page with a one-time googleusercontent URL.
+      const movedHrefMatch = text.match(/<A HREF="([^"]+)">here<\/A>/i);
+      if (attempt < 2 && movedHrefMatch && movedHrefMatch[1]) {
+        const movedUrl = movedHrefMatch[1].replace(/&amp;/g, "&");
+        try {
+          const movedRes = await fetch(movedUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: payload,
+            redirect: "follow",
+          });
+          const movedText = await movedRes.text();
+          const movedJson = JSON.parse(movedText);
+          appsScriptLastOkAt = Date.now();
+          appsScriptLastError = "";
+          perfDuration("apps_script_call", startedAt, {
+            action,
+            attempt,
+            status: movedRes.status,
+            moved: true,
+          });
+          return movedJson;
+        } catch {}
+      }
 
-    let errorMsg = "";
-    const m = text.match(/<div[^>]*class="errorMessage"[^>]*>([^<]*)<\/div>/i);
-    if (m && m[1]) {
-      errorMsg = m[1].trim();
+      let errorMsg = "";
+      const m = text.match(/<div[^>]*class="errorMessage"[^>]*>([^<]*)<\/div>/i);
+      if (m && m[1]) {
+        errorMsg = m[1].trim();
+      }
+      const snippet = errorMsg || text.slice(0, 1200);
+      const isRetryableHtml =
+        /FAILED_PRECONDITION/i.test(snippet) ||
+        /Exceeded maximum execution time/i.test(snippet) ||
+        /server error occurred/i.test(snippet) ||
+        /Moved Temporarily/i.test(snippet) ||
+        /Page not found/i.test(snippet) ||
+        res.status >= 500;
+      const willRetry = attempt < 4 && isRetryableHtml;
+      if (!opts.silent && !willRetry) {
+        console.error("Apps Script non-JSON response:", res.status, snippet);
+      }
+      appsScriptLastError = `HTTP ${res.status}: ${snippet.slice(0, 180)}`;
+      if (willRetry) {
+        const waitMs = 500 * Math.pow(2, attempt);
+        await sleep(waitMs);
+        const retried = await postToAppsScript(bodyObj, attempt + 1, opts);
+        perfDuration("apps_script_call", startedAt, {
+          action,
+          attempt,
+          status: res.status,
+          retried: true,
+        });
+        return retried;
+      }
+      throw new Error("Apps Script returned non-JSON response");
     }
-    const snippet = errorMsg || text.slice(0, 1200);
-    const isRetryableHtml =
-      /FAILED_PRECONDITION/i.test(snippet) ||
-      /Exceeded maximum execution time/i.test(snippet) ||
-      /server error occurred/i.test(snippet) ||
-      /Moved Temporarily/i.test(snippet) ||
-      /Page not found/i.test(snippet) ||
-      res.status >= 500;
-    const willRetry = attempt < 4 && isRetryableHtml;
-    if (!opts.silent && !willRetry) {
-      console.error("Apps Script non-JSON response:", res.status, snippet);
+    if (!res.ok) {
+      if (!opts.silent) {
+        console.error("Apps Script HTTP error:", res.status, json);
+      }
+      appsScriptLastError = `HTTP ${res.status}: ${JSON.stringify(json).slice(0, 180)}`;
+      if (attempt < 4 && res.status >= 500) {
+        const waitMs = 500 * Math.pow(2, attempt);
+        await sleep(waitMs);
+        const retried = await postToAppsScript(bodyObj, attempt + 1, opts);
+        perfDuration("apps_script_call", startedAt, {
+          action,
+          attempt,
+          status: res.status,
+          retried: true,
+        });
+        return retried;
+      }
     }
-    appsScriptLastError = `HTTP ${res.status}: ${snippet.slice(0, 180)}`;
-    if (willRetry) {
-      const waitMs = 500 * Math.pow(2, attempt);
-      await sleep(waitMs);
-      return postToAppsScript(bodyObj, attempt + 1, opts);
-    }
-    throw new Error("Apps Script returned non-JSON response");
+    appsScriptLastOkAt = Date.now();
+    appsScriptLastError = "";
+    perfDuration("apps_script_call", startedAt, {
+      action,
+      attempt,
+      status: res.status,
+    });
+    return json;
+  } catch (err) {
+    perfDuration(
+      "apps_script_call",
+      startedAt,
+      {
+        action,
+        attempt,
+        error: true,
+        message: String(err?.message || err || "").slice(0, 180),
+      },
+      true
+    );
+    throw err;
   }
-  if (!res.ok) {
-    if (!opts.silent) {
-      console.error("Apps Script HTTP error:", res.status, json);
-    }
-    appsScriptLastError = `HTTP ${res.status}: ${JSON.stringify(json).slice(0, 180)}`;
-    if (attempt < 4 && res.status >= 500) {
-      const waitMs = 500 * Math.pow(2, attempt);
-      await sleep(waitMs);
-      return postToAppsScript(bodyObj, attempt + 1, opts);
-    }
-  }
-  appsScriptLastOkAt = Date.now();
-  appsScriptLastError = "";
-  return json;
 }
 
 async function toggleDoneAndClearRemind(rowSerial) {
@@ -2463,7 +2729,12 @@ client.once("clientReady", async () => {
     if (!entry?.messageId) continue;
     if (entry.intervalId) clearInterval(entry.intervalId);
     const intervalId = startTimersInterval(client, channelId, entry.messageId);
-    timersMessageByChannel.set(channelId, { messageId: entry.messageId, intervalId });
+    timersMessageByChannel.set(channelId, {
+      messageId: entry.messageId,
+      intervalId,
+      lastRenderedContent: entry.lastRenderedContent ?? null,
+      lastVerifiedAt: entry.lastVerifiedAt ?? 0,
+    });
   }
   if (timersMessageByChannel.size > 0) {
     persistTimersStore();
@@ -2472,15 +2743,20 @@ client.once("clientReady", async () => {
   for (const [channelId, entry] of reservationsMessageByChannel.entries()) {
     if (!entry?.messageId) continue;
     try {
-      const ch = await client.channels.fetch(channelId);
+      const ch = await getTextBasedChannel(client, channelId);
       if (ch?.isTextBased()) {
         try {
-          await ch.messages.fetch(entry.messageId);
+          await getChannelMessage(ch, entry.messageId);
         } catch (e) {
           if (getDiscordErrorCode(e) === 10008) {
             const existing = await findExistingReservationsMessage(ch, client);
             if (existing?.id) {
-              reservationsMessageByChannel.set(channelId, { messageId: existing.id, intervalId: entry.intervalId || null });
+              reservationsMessageByChannel.set(channelId, {
+                messageId: existing.id,
+                intervalId: entry.intervalId || null,
+                lastRenderedContent: entry.lastRenderedContent ?? null,
+                lastVerifiedAt: entry.lastVerifiedAt ?? 0,
+              });
             }
           }
         }
@@ -2489,7 +2765,12 @@ client.once("clientReady", async () => {
     if (entry.intervalId) clearInterval(entry.intervalId);
     const current = reservationsMessageByChannel.get(channelId) || entry;
     const intervalId = startReservationsInterval(client, channelId, current.messageId);
-    reservationsMessageByChannel.set(channelId, { messageId: current.messageId, intervalId });
+    reservationsMessageByChannel.set(channelId, {
+      messageId: current.messageId,
+      intervalId,
+      lastRenderedContent: current.lastRenderedContent ?? null,
+      lastVerifiedAt: current.lastVerifiedAt ?? 0,
+    });
   }
   if (reservationsMessageByChannel.size > 0) {
     persistReservationsStore();
@@ -2502,6 +2783,14 @@ client.once("clientReady", async () => {
 client.on("interactionCreate", async (interaction) => {
   try {
     if (interaction.isButton()) {
+      if (isDuplicateButtonInteraction(interaction.id)) {
+        perfLog("button_duplicate_ignored", {
+          interactionId: interaction.id || null,
+          buttonId: interaction.customId || null,
+          userId: interaction.user?.id || null,
+        });
+        return;
+      }
       appendButtonLog({
         ts: new Date().toISOString(),
         interactionId: interaction.id || null,
@@ -2606,7 +2895,12 @@ client.on("interactionCreate", async (interaction) => {
       if (existing?.intervalId) clearInterval(existing.intervalId);
 
       const intervalId = startTimersInterval(client, channelId, msg.id);
-      timersMessageByChannel.set(channelId, { messageId: msg.id, intervalId });
+      timersMessageByChannel.set(channelId, {
+        messageId: msg.id,
+        intervalId,
+        lastRenderedContent: text,
+        lastVerifiedAt: Date.now(),
+      });
       persistTimersStore();
       return;
     }
@@ -2627,7 +2921,12 @@ client.on("interactionCreate", async (interaction) => {
       if (existing?.intervalId) clearInterval(existing.intervalId);
 
       const intervalId = startReservationsInterval(client, channelId, msg.id);
-      reservationsMessageByChannel.set(channelId, { messageId: msg.id, intervalId });
+      reservationsMessageByChannel.set(channelId, {
+        messageId: msg.id,
+        intervalId,
+        lastRenderedContent: text,
+        lastVerifiedAt: Date.now(),
+      });
       persistReservationsStore();
       return;
     }
@@ -3269,18 +3568,21 @@ client.on("interactionCreate", async (interaction) => {
               const pingUserId = pingUserIdFromCustom || getDiscordUserIdFromEmbed(interaction.message);
               return buildRequestActionRow(rowSerial, optimisticReservation, "arm", optimisticCompleted, pingUserId, true);
             })();
+        const ackStartedAt = Date.now();
         let interactionAcked = false;
         let optimisticApplied = false;
         try {
           await interaction.update({ embeds: [optimisticBase], components: [optimisticRow] });
           interactionAcked = true;
           optimisticApplied = true;
+          perfDuration("done_interaction_ack", ackStartedAt, { rowSerial, ackType: "update" });
         } catch (e) {
           if (isUnknownInteractionError(e)) return;
           console.error("Failed to optimistically update done button:", e);
           try {
             await interaction.deferUpdate();
             interactionAcked = true;
+            perfDuration("done_interaction_ack", ackStartedAt, { rowSerial, ackType: "deferUpdate" });
           } catch (deferErr) {
             if (isUnknownInteractionError(deferErr)) return;
           }
