@@ -18,6 +18,7 @@
  * ✅ Clicking Done cancels any reminder and clears Remind At
  *
  * Requires your Apps Script to support:
+ * - { action:"toggle_done_and_clear_remind", rowSerial:"123" } -> { success:true, done:true/false, reminder:false }
  * - { action:"toggle_done", rowSerial:"123" } -> { success:true, done:true/false }
  * - { action:"remind", rowSerial:"123" }      -> { success:true }
  * - { action:"clear_remind", rowSerial:"123"} -> { success:true }
@@ -109,7 +110,7 @@ const RESERVATIONS_STORE_PATH = path.join(__dirname, "reservations-messages.json
 const RESERVATION_OWNER_STORE_PATH = path.join(__dirname, "reservation-owners.json");
 const RESERVATION_MESSAGE_STORE_PATH = path.join(__dirname, "reservation-messages.json");
 const AUDIT_LOG_PATH = path.join(__dirname, "audit.log");
-const BUTTON_LOG_PATH = path.join(__dirname, "button-logs.json");
+const BUTTON_LOG_PATH = path.join(__dirname, "button-logs.ndjson");
 const TIMERS_CACHE_MAX_AGE_MS = 60_000;
 
 function readJsonSafe(filepath, fallback = {}) {
@@ -137,10 +138,9 @@ function auditLog(event, data = {}) {
 function appendButtonLog(entry) {
   if (!BUTTON_LOGGER_ENABLED) return;
   try {
-    const existing = readJsonSafe(BUTTON_LOG_PATH, []);
-    const list = Array.isArray(existing) ? existing : [];
-    list.push(entry);
-    writeJsonSafe(BUTTON_LOG_PATH, list);
+    // Fire-and-forget append to avoid blocking the interaction ack path.
+    const line = `${JSON.stringify(entry)}\n`;
+    fs.appendFile(BUTTON_LOG_PATH, line, "utf8", () => {});
   } catch {}
 }
 
@@ -717,7 +717,7 @@ const timersMessageByChannel = new Map(); // channelId -> { messageId, intervalI
 const reservationsMessageByChannel = new Map(); // channelId -> { messageId, intervalId }
 const interactionCooldowns = new Map(); // key -> expiresAtMs
 const doneToggleInFlight = new Set(); // rowSerial keys currently toggling done/not done
-const LIVE_MESSAGE_REFRESH_MS = 30_000;
+const LIVE_MESSAGE_REFRESH_MS = 15_000;
 let startupStickyDelayUntil = 0;
 let lastTimersText = null;
 let lastTimersTextAt = 0;
@@ -730,7 +730,7 @@ let timersSnapshotAt = 0;
 let runtimeClient = null;
 let orphanReservationCleanupInFlight = false;
 let reservationStateSyncInFlight = false;
-const TIMERS_REFRESH_MS = 30_000;
+const TIMERS_REFRESH_MS = 15_000;
 let timersNextFetchAttemptAt = 0;
 let timersFailureStreak = 0;
 let timersSnapshotRefreshPromise = null;
@@ -1669,6 +1669,13 @@ async function updateReminderMessagePingVisibility(client, rowSerial, showPing, 
   return true;
 }
 
+async function syncLinkedDoneState(client, sourceMessage, rowSerial, completed, showPing = true) {
+  if (isReminderMessage(sourceMessage)) {
+    return updateOriginalRequestFromReminder(client, sourceMessage, rowSerial, completed, showPing);
+  }
+  return updateReminderMessagePingVisibility(client, rowSerial, showPing, completed);
+}
+
 async function postReminder({ client, channelId, rowSerial, title, username, coordinates, discordMention, reservationStr, sourceMessageUrl }) {
   const targetChannelId = REMINDER_CHANNEL_ID || channelId;
   const ch = await client.channels.fetch(targetChannelId);
@@ -2368,6 +2375,22 @@ async function postToAppsScript(bodyObj, attempt = 0, opts = {}) {
   return json;
 }
 
+async function toggleDoneAndClearRemind(rowSerial) {
+  try {
+    const combined = await postToAppsScript({ action: "toggle_done_and_clear_remind", rowSerial });
+    if (combined?.success) return combined;
+    const msg = String(combined?.message || "").toLowerCase();
+    const unsupported = msg.includes("missing action") || msg.includes("unknown action") || msg.includes("unsupported");
+    if (!unsupported) return combined;
+  } catch {}
+
+  try {
+    await postToAppsScript({ action: "clear_remind", rowSerial });
+  } catch {}
+
+  return postToAppsScript({ action: "toggle_done", rowSerial });
+}
+
 // =====================
 // SLASH COMMANDS
 // =====================
@@ -2481,6 +2504,7 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isButton()) {
       appendButtonLog({
         ts: new Date().toISOString(),
+        interactionId: interaction.id || null,
         userId: interaction.user?.id || null,
         username: interaction.user?.tag || interaction.user?.username || null,
         buttonId: interaction.customId || null,
@@ -3263,34 +3287,37 @@ client.on("interactionCreate", async (interaction) => {
         }
         if (!interactionAcked) return;
 
+        syncLinkedDoneState(client, interaction.message, rowSerial, optimisticCompleted, true)
+          .catch((e) => console.error("Failed to optimistically sync linked message:", e));
+
         const reminderKey = String(rowSerial);
         const hadReminder = reminderTimers.has(reminderKey) || reminderMeta.has(reminderKey);
         const reminderMetaEntry = reminderMeta.get(reminderKey);
         const reminderFired = !!reminderMetaEntry?.fired;
 
-        // Always cancel timer + clear sheet reminder
+        // Always cancel timer locally, then persist done+reminder state in sheet.
         cancelReminder(rowSerial, true);
-        try {
-          await postToAppsScript({ action: "clear_remind", rowSerial });
-        } catch {}
 
-        // Toggle DONE in sheet
         let json;
         try {
-          json = await postToAppsScript({ action: "toggle_done", rowSerial });
+          json = await toggleDoneAndClearRemind(rowSerial);
         } catch (e) {
-          console.error("toggle_done fetch error:", e);
+          console.error("toggle_done_and_clear_remind fetch error:", e);
           if (previousEmbeds?.length && previousComponents?.length) {
             await interaction.message.edit({ embeds: previousEmbeds, components: previousComponents });
           }
+          await syncLinkedDoneState(client, interaction.message, rowSerial, wasCompleted, true)
+            .catch((syncErr) => console.error("Failed to rollback linked message after done error:", syncErr));
           return;
         }
 
         if (!json?.success) {
-          console.error("toggle_done failed:", json);
+          console.error("toggle_done_and_clear_remind failed:", json);
           if (previousEmbeds?.length && previousComponents?.length) {
             await interaction.message.edit({ embeds: previousEmbeds, components: previousComponents });
           }
+          await syncLinkedDoneState(client, interaction.message, rowSerial, wasCompleted, true)
+            .catch((syncErr) => console.error("Failed to rollback linked message after done failure:", syncErr));
           return;
         }
 
@@ -3326,18 +3353,10 @@ client.on("interactionCreate", async (interaction) => {
           });
         }
 
-        if (isReminder) {
-          try {
-            await updateOriginalRequestFromReminder(client, interaction.message, rowSerial, completed);
-          } catch (e) {
-            console.error("Failed to sync original request from reminder:", e);
-          }
-        } else {
-          try {
-            await updateReminderMessagePingVisibility(client, rowSerial, completed, completed);
-          } catch (e) {
-            console.error("Failed to sync reminder from original request:", e);
-          }
+        try {
+          await syncLinkedDoneState(client, interaction.message, rowSerial, completed, true);
+        } catch (e) {
+          console.error("Failed to sync linked message from done toggle:", e);
         }
 
         // Immediate timers refresh for all active timers messages
