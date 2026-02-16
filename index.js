@@ -121,6 +121,7 @@ const PERF_LOGGER_ENABLED = String(PERF_LOGGER ?? "1").trim() === "1";
 const PERF_SLOW_THRESHOLD_MS = Math.max(0, Number(PERF_SLOW_MS ?? "200") || 0);
 const CONTENT_VERIFY_INTERVAL_MS = 5 * 60_000;
 const BUTTON_INTERACTION_TTL_MS = 2 * 60_000;
+const PERF_METRIC_MAX_SAMPLES = 200;
 
 function readJsonSafe(filepath, fallback = {}) {
   try {
@@ -136,6 +137,7 @@ function readJsonSafe(filepath, fallback = {}) {
 const bufferedJsonWrites = new Map(); // filepath -> { data, timer, inFlight, dirty }
 const bufferedLogWrites = new Map(); // filepath -> { chunks, timer, inFlight }
 const processedButtonInteractionIds = new Map(); // interactionId -> expiresAtMs
+const perfMetrics = new Map(); // key -> { samples:number[], totalCount:number, errorCount:number, lastMs:number, lastAt:number }
 
 function flushJsonWrite(filepath) {
   const state = bufferedJsonWrites.get(filepath);
@@ -231,8 +233,92 @@ function perfLog(event, data = {}) {
   } catch {}
 }
 
+function perfMetricKey(event, data = {}) {
+  if (event === "apps_script_call") return `apps:${String(data.action || "unknown")}`;
+  if (event === "discord_message_edit") return `discord_edit:${String(data.scope || "unknown")}`;
+  if (event === "done_interaction_ack") return `done_ack:${String(data.ackType || "unknown")}`;
+  if (event === "timers_tick") return "timers_tick";
+  if (event === "reservations_tick") return "reservations_tick";
+  if (event === "sheetdb_snapshot_fetch") return "sheetdb_snapshot_fetch";
+  return String(event);
+}
+
+function recordPerfSample(event, durationMs, data = {}) {
+  const key = perfMetricKey(event, data);
+  const current = perfMetrics.get(key) || {
+    samples: [],
+    totalCount: 0,
+    errorCount: 0,
+    lastMs: 0,
+    lastAt: 0,
+  };
+  current.samples.push(durationMs);
+  if (current.samples.length > PERF_METRIC_MAX_SAMPLES) current.samples.shift();
+  current.totalCount += 1;
+  if (data.error) current.errorCount += 1;
+  current.lastMs = durationMs;
+  current.lastAt = Date.now();
+  perfMetrics.set(key, current);
+}
+
+function percentileFromSorted(sortedValues, p) {
+  if (!sortedValues.length) return 0;
+  const idx = Math.max(0, Math.min(sortedValues.length - 1, Math.ceil((p / 100) * sortedValues.length) - 1));
+  return sortedValues[idx];
+}
+
+function formatMs(ms) {
+  if (!Number.isFinite(ms)) return "n/a";
+  return `${ms.toFixed(1)}ms`;
+}
+
+function buildPerfSummaryLines(limit = 12) {
+  if (perfMetrics.size === 0) {
+    return ["No performance samples yet. Use the bot for a minute and retry."];
+  }
+
+  const now = Date.now();
+  const rows = [];
+  for (const [key, state] of perfMetrics.entries()) {
+    const samples = Array.isArray(state.samples) ? state.samples.slice() : [];
+    if (samples.length === 0) continue;
+    samples.sort((a, b) => a - b);
+    const sum = samples.reduce((acc, v) => acc + v, 0);
+    const avg = sum / samples.length;
+    const p50 = percentileFromSorted(samples, 50);
+    const p95 = percentileFromSorted(samples, 95);
+    const errorRate = state.totalCount > 0 ? (state.errorCount / state.totalCount) * 100 : 0;
+    rows.push({
+      key,
+      samples: samples.length,
+      totalCount: state.totalCount,
+      avg,
+      p50,
+      p95,
+      errorRate,
+      lastAgoSec: Math.max(0, Math.floor((now - Number(state.lastAt || 0)) / 1000)),
+    });
+  }
+
+  rows.sort((a, b) => b.p95 - a.p95 || b.avg - a.avg);
+  const lines = [
+    `Recent perf metrics (window <= ${PERF_METRIC_MAX_SAMPLES} samples per metric)`,
+    `Logger: ${PERF_LOGGER_ENABLED ? "on" : "off"} | slow-log threshold: ${PERF_SLOW_THRESHOLD_MS}ms`,
+  ];
+  for (const row of rows.slice(0, limit)) {
+    lines.push(
+      `${row.key} | p50 ${formatMs(row.p50)} | p95 ${formatMs(row.p95)} | avg ${formatMs(row.avg)} | n ${row.samples}/${row.totalCount} | err ${row.errorRate.toFixed(1)}% | last ${row.lastAgoSec}s`
+    );
+  }
+  if (rows.length > limit) {
+    lines.push(`...and ${rows.length - limit} more metrics`);
+  }
+  return lines;
+}
+
 function perfDuration(event, startedAtMs, data = {}, force = false) {
   const durationMs = Date.now() - startedAtMs;
+  recordPerfSample(event, durationMs, data);
   if (force || durationMs >= PERF_SLOW_THRESHOLD_MS) {
     perfLog(event, { durationMs, ...data });
   }
@@ -2689,6 +2775,10 @@ const statusCommand = new SlashCommandBuilder()
   .setName("status")
   .setDescription("Show bot health and integration status.");
 
+const perfCommand = new SlashCommandBuilder()
+  .setName("perf")
+  .setDescription("Show recent runtime performance metrics.");
+
 const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 (async () => {
   const body = [
@@ -2698,6 +2788,7 @@ const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
     timersCommand.toJSON(),
     reservationsCommand.toJSON(),
     statusCommand.toJSON(),
+    perfCommand.toJSON(),
   ];
   await Promise.all(
     TARGET_GUILD_IDS.map(async (guildId) => {
@@ -2877,6 +2968,12 @@ client.on("interactionCreate", async (interaction) => {
       ];
       if (appsScriptLastError) lines.push(`Last error: ${appsScriptLastError.slice(0, 140)}`);
       return interaction.reply({ flags: MessageFlags.Ephemeral, content: lines.join("\n") });
+    }
+
+    if (interaction.isChatInputCommand() && interaction.commandName === "perf") {
+      const lines = buildPerfSummaryLines(14);
+      const content = lines.join("\n").slice(0, 3900);
+      return interaction.reply({ flags: MessageFlags.Ephemeral, content });
     }
 
     // /timers
