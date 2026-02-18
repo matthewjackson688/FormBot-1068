@@ -949,6 +949,8 @@ const TIMERS_REFRESH_MS = 15_000;
 let timersNextFetchAttemptAt = 0;
 let timersFailureStreak = 0;
 let timersSnapshotRefreshPromise = null;
+let timersSnapshotBackgroundIntervalId = null;
+let timersSnapshotBackgroundInFlight = false;
 const timersStore = readJsonSafe(TIMERS_STORE_PATH, {});
 const reservationsStore = readJsonSafe(RESERVATIONS_STORE_PATH, {});
 
@@ -1023,7 +1025,7 @@ function startTimersInterval(client, channelId, messageId) {
     let skipReason = null;
     inFlight = true;
     try {
-      const updated = await fetchTimersText();
+      const updated = await fetchTimersText({ cacheOnly: true });
       hadSnapshot = !!updated;
       if (!updated) return;
 
@@ -1144,7 +1146,7 @@ function startReservationsInterval(client, channelId, messageId) {
     let skipReason = null;
     inFlight = true;
     try {
-      updated = await fetchReservationsText();
+      updated = await fetchReservationsText({ cacheOnly: true });
       hadSnapshot = !!updated;
       if (!updated) return;
 
@@ -1452,68 +1454,8 @@ function formatReservationForUserTimezone(reservationUtcStr, tz) {
   return `${reservationUtcStr} (UTC)`;
 }
 
-async function fetchTimersText() {
-  const now = Date.now();
-  if (now < timersNextFetchAttemptAt) {
-    if (lastTimersText && now - lastTimersTextAt <= TIMERS_CACHE_MAX_AGE_MS) return lastTimersText;
-    return null;
-  }
-  if (!timersSnapshot || now - timersSnapshotAt >= TIMERS_REFRESH_MS) {
-    if (!timersSnapshotRefreshPromise) {
-      timersSnapshotRefreshPromise = (async () => {
-        let json;
-        try {
-          if (SHEETDB_URL) {
-            json = await fetchTimersSnapshotFromSheetDb();
-          } else {
-            json = await postToAppsScript({ action: "list_timers" });
-          }
-        } catch (e) {
-          const msg = String(e?.message || e || "");
-          const isRateLimited = /HTTP 429|Request limit exceeded/i.test(msg);
-          if (Date.now() - timersLastFailureAt > 10_000) {
-            console.error("list_timers fetch error:", e);
-          }
-          // Fallback to Apps Script if SheetDB is unavailable
-          if (SHEETDB_URL && !isRateLimited) {
-            try {
-              json = await postToAppsScript({ action: "list_timers" });
-            } catch {}
-          }
-          if (!json) {
-            setTimersBackoff(isRateLimited);
-            return false;
-          }
-        }
-
-        if (!json?.success) {
-          if (Date.now() - timersLastFailureAt > 10_000) {
-            console.error("list_timers failed:", json);
-          }
-          const isRateLimited = /429|limit/i.test(JSON.stringify(json || ""));
-          setTimersBackoff(isRateLimited);
-          return false;
-        }
-
-        timersFailureStreak = 0;
-        timersNextFetchAttemptAt = 0;
-        timersSnapshot = json;
-        timersSnapshotAt = Date.now();
-        await reconcileDeletedReservations(json.activeSerials);
-        await reconcileReservationState(json.rowStates);
-        return true;
-      })().finally(() => {
-        timersSnapshotRefreshPromise = null;
-      });
-    }
-
-    const refreshed = await timersSnapshotRefreshPromise;
-    if (!refreshed && (!lastTimersText || Date.now() - lastTimersTextAt > TIMERS_CACHE_MAX_AGE_MS)) {
-      return null;
-    }
-    if (!refreshed) return lastTimersText;
-  }
-
+function renderTimersTextFromSnapshot() {
+  if (!timersSnapshot) return null;
   const ageSeconds = Math.max(0, Math.floor((Date.now() - timersSnapshotAt) / 1000));
   const byTitle = new Map((timersSnapshot.timers || []).map((t) => [String(t.title), Number(t.elapsedSeconds) + ageSeconds]));
   const nextByTitle = new Map((timersSnapshot.nextReservations || []).map((t) => [
@@ -1577,14 +1519,78 @@ async function fetchTimersText() {
   return text;
 }
 
-async function fetchReservationsText() {
+async function fetchTimersText(opts = {}) {
+  const cacheOnly = !!opts.cacheOnly;
   const now = Date.now();
-  if (now < timersNextFetchAttemptAt) return null;
-  if (!timersSnapshot || now - timersSnapshotAt >= TIMERS_REFRESH_MS) {
-    await fetchTimersText();
-    if (!timersSnapshot) return null;
+  if (cacheOnly) {
+    const rendered = renderTimersTextFromSnapshot();
+    if (rendered) return rendered;
+    if (lastTimersText && now - lastTimersTextAt <= TIMERS_CACHE_MAX_AGE_MS) return lastTimersText;
+    return null;
   }
+  if (now < timersNextFetchAttemptAt) {
+    if (lastTimersText && now - lastTimersTextAt <= TIMERS_CACHE_MAX_AGE_MS) return lastTimersText;
+    return null;
+  }
+  if (!timersSnapshot || now - timersSnapshotAt >= TIMERS_REFRESH_MS) {
+    if (!timersSnapshotRefreshPromise) {
+      timersSnapshotRefreshPromise = (async () => {
+        let json;
+        try {
+          if (SHEETDB_URL) {
+            json = await fetchTimersSnapshotFromSheetDb();
+          } else {
+            json = await postToAppsScript({ action: "list_timers" });
+          }
+        } catch (e) {
+          const msg = String(e?.message || e || "");
+          const isRateLimited = /HTTP 429|Request limit exceeded/i.test(msg);
+          if (Date.now() - timersLastFailureAt > 10_000) {
+            console.error("list_timers fetch error:", e);
+          }
+          if (SHEETDB_URL && !isRateLimited) {
+            try {
+              json = await postToAppsScript({ action: "list_timers" });
+            } catch {}
+          }
+          if (!json) {
+            setTimersBackoff(isRateLimited);
+            return false;
+          }
+        }
 
+        if (!json?.success) {
+          if (Date.now() - timersLastFailureAt > 10_000) {
+            console.error("list_timers failed:", json);
+          }
+          const isRateLimited = /429|limit/i.test(JSON.stringify(json || ""));
+          setTimersBackoff(isRateLimited);
+          return false;
+        }
+
+        timersFailureStreak = 0;
+        timersNextFetchAttemptAt = 0;
+        timersSnapshot = json;
+        timersSnapshotAt = Date.now();
+        await reconcileDeletedReservations(json.activeSerials);
+        await reconcileReservationState(json.rowStates);
+        return true;
+      })().finally(() => {
+        timersSnapshotRefreshPromise = null;
+      });
+    }
+
+    const refreshed = await timersSnapshotRefreshPromise;
+    if (!refreshed && (!lastTimersText || Date.now() - lastTimersTextAt > TIMERS_CACHE_MAX_AGE_MS)) {
+      return null;
+    }
+    if (!refreshed) return lastTimersText;
+  }
+  return renderTimersTextFromSnapshot();
+}
+
+function renderReservationsTextFromSnapshot() {
+  if (!timersSnapshot) return null;
   const ageSeconds = Math.max(0, Math.floor((Date.now() - timersSnapshotAt) / 1000));
   const nextByTitle = new Map((timersSnapshot.nextReservations || []).map((t) => [
     String(t.title),
@@ -1617,11 +1623,49 @@ async function fetchReservationsText() {
   ].join("\n");
 }
 
+async function fetchReservationsText(opts = {}) {
+  const cacheOnly = !!opts.cacheOnly;
+  const now = Date.now();
+  if (cacheOnly) return renderReservationsTextFromSnapshot();
+  if (now < timersNextFetchAttemptAt) return null;
+  if (!timersSnapshot || now - timersSnapshotAt >= TIMERS_REFRESH_MS) {
+    await fetchTimersText();
+    if (!timersSnapshot) return null;
+  }
+  return renderReservationsTextFromSnapshot();
+}
+
+async function refreshTimersSnapshotInBackground() {
+  if (timersSnapshotBackgroundInFlight) return;
+  timersSnapshotBackgroundInFlight = true;
+  const startedAt = Date.now();
+  try {
+    const text = await fetchTimersText();
+    perfDuration("snapshot_refresh_loop", startedAt, { ok: !!text });
+  } finally {
+    timersSnapshotBackgroundInFlight = false;
+  }
+}
+
+function startSnapshotRefreshLoop() {
+  if (timersSnapshotBackgroundIntervalId) {
+    clearInterval(timersSnapshotBackgroundIntervalId);
+  }
+  refreshTimersSnapshotInBackground().catch((e) => {
+    console.error("snapshot warmup failed:", e);
+  });
+  timersSnapshotBackgroundIntervalId = setInterval(() => {
+    refreshTimersSnapshotInBackground().catch((e) => {
+      console.error("snapshot refresh loop error:", e);
+    });
+  }, TIMERS_REFRESH_MS);
+}
+
 async function updateTimersMessage(client, channelId) {
   const entry = timersMessageByChannel.get(channelId);
   if (!entry?.messageId) return;
 
-  const text = await fetchTimersText();
+  const text = await fetchTimersText({ cacheOnly: true });
   if (!text) return;
   if (shouldSkipRenderedUpdate(entry, text)) return;
 
@@ -1640,7 +1684,7 @@ async function updateTimersMessage(client, channelId) {
 
 async function updateAllTimersMessages(client) {
   if (timersMessageByChannel.size === 0) return;
-  const text = await fetchTimersText();
+  const text = await fetchTimersText({ cacheOnly: true });
   if (!text) return;
 
   await Promise.all(
@@ -1671,7 +1715,7 @@ async function updateAllTimersMessages(client) {
 
 async function updateAllReservationsMessages(client) {
   if (reservationsMessageByChannel.size === 0) return;
-  const text = await fetchReservationsText();
+  const text = await fetchReservationsText({ cacheOnly: true });
   if (!text) return;
 
   await Promise.all(
@@ -2811,6 +2855,7 @@ client.once("clientReady", async () => {
   } catch (e) {
     console.error("❌ ensurePanel failed:", e);
   }
+  startSnapshotRefreshLoop();
 
   for (const [channelId, entry] of timersMessageByChannel.entries()) {
     if (!entry?.messageId) continue;
@@ -2920,11 +2965,18 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       try {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      } catch (e) {
+        if (isUnknownInteractionError(e)) return;
+        throw e;
+      }
+
+      try {
         await ensurePanel(client, { cleanupExtra: true });
-        return interaction.reply({ flags: MessageFlags.Ephemeral, content: "✅ Panel synced (duplicates cleaned where found)." });
+        return interaction.editReply("✅ Panel synced (duplicates cleaned where found).");
       } catch (e) {
         console.error("panel-reset ensurePanel failed:", e);
-        return interaction.reply({ flags: MessageFlags.Ephemeral, content: "❌ Panel sync failed (check logs)." });
+        return interaction.editReply("❌ Panel sync failed (check logs).");
       }
     }
 
@@ -2975,9 +3027,10 @@ client.on("interactionCreate", async (interaction) => {
     // /timers
     if (interaction.isChatInputCommand() && interaction.commandName === "timers") {
       await interaction.deferReply();
-      const text = await fetchTimersText();
+      const text = await fetchTimersText({ cacheOnly: true });
       if (!text) {
-        return interaction.editReply("❌ Failed to fetch timers.");
+        refreshTimersSnapshotInBackground().catch(() => {});
+        return interaction.editReply("⏳ Timers cache is warming up. Try again in a few seconds.");
       }
 
       await interaction.editReply(text);
@@ -3001,9 +3054,10 @@ client.on("interactionCreate", async (interaction) => {
     // /reservations
     if (interaction.isChatInputCommand() && interaction.commandName === "reservations") {
       await interaction.deferReply();
-      const text = await fetchReservationsText();
+      const text = await fetchReservationsText({ cacheOnly: true });
       if (!text) {
-        return interaction.editReply("❌ Failed to fetch reservations.");
+        refreshTimersSnapshotInBackground().catch(() => {});
+        return interaction.editReply("⏳ Reservations cache is warming up. Try again in a few seconds.");
       }
 
       await interaction.editReply(text);
