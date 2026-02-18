@@ -946,11 +946,21 @@ let runtimeClient = null;
 let orphanReservationCleanupInFlight = false;
 let reservationStateSyncInFlight = false;
 const TIMERS_REFRESH_MS = 15_000;
+const SNAPSHOT_FETCH_TIMEOUT_MS = 8_000;
+const SNAPSHOT_RECONCILE_INTERVAL_MS = 60_000;
+const SNAPSHOT_REFRESH_SLOW_MS = 10_000;
+const SNAPSHOT_REFRESH_VERY_SLOW_MS = 20_000;
+const SNAPSHOT_REFRESH_SLOW_DELAY_MS = 30_000;
+const SNAPSHOT_REFRESH_MAX_DELAY_MS = 60_000;
 let timersNextFetchAttemptAt = 0;
 let timersFailureStreak = 0;
 let timersSnapshotRefreshPromise = null;
 let timersSnapshotBackgroundIntervalId = null;
 let timersSnapshotBackgroundInFlight = false;
+let lastSnapshotRefreshDurationMs = 0;
+let lastSnapshotReconcileAt = 0;
+let snapshotReconcileInFlight = false;
+let pendingSnapshotReconcile = null;
 const timersStore = readJsonSafe(TIMERS_STORE_PATH, {});
 const reservationsStore = readJsonSafe(RESERVATIONS_STORE_PATH, {});
 
@@ -986,6 +996,51 @@ function setTimersBackoff(isRateLimited = false) {
     ? Math.min(10 * 60_000, 60_000 * Math.pow(2, Math.max(0, timersFailureStreak - 1)))
     : Math.min(60_000, 5_000 * Math.pow(2, Math.max(0, timersFailureStreak - 1)));
   timersNextFetchAttemptAt = Date.now() + backoffMs;
+}
+
+function getAdaptiveSnapshotRefreshDelayMs() {
+  if (timersFailureStreak >= 3) return SNAPSHOT_REFRESH_MAX_DELAY_MS;
+  if (timersFailureStreak > 0) return SNAPSHOT_REFRESH_SLOW_DELAY_MS;
+  if (lastSnapshotRefreshDurationMs >= SNAPSHOT_REFRESH_VERY_SLOW_MS) return SNAPSHOT_REFRESH_MAX_DELAY_MS;
+  if (lastSnapshotRefreshDurationMs >= SNAPSHOT_REFRESH_SLOW_MS) return SNAPSHOT_REFRESH_SLOW_DELAY_MS;
+  return TIMERS_REFRESH_MS;
+}
+
+function tryStartSnapshotReconcile() {
+  if (snapshotReconcileInFlight) return;
+  if (!pendingSnapshotReconcile) return;
+  if (Date.now() - lastSnapshotReconcileAt < SNAPSHOT_RECONCILE_INTERVAL_MS) return;
+
+  const payload = pendingSnapshotReconcile;
+  pendingSnapshotReconcile = null;
+  snapshotReconcileInFlight = true;
+  lastSnapshotReconcileAt = Date.now();
+
+  (async () => {
+    const startedAt = Date.now();
+    try {
+      await reconcileDeletedReservations(payload.activeSerials);
+      await reconcileReservationState(payload.rowStates);
+      perfDuration("snapshot_reconcile", startedAt, {
+        activeSerialCount: Array.isArray(payload.activeSerials) ? payload.activeSerials.length : 0,
+        rowStateCount: Array.isArray(payload.rowStates) ? payload.rowStates.length : 0,
+      });
+    } catch (e) {
+      perfDuration("snapshot_reconcile", startedAt, { error: true });
+      console.error("snapshot reconcile error:", e);
+    } finally {
+      snapshotReconcileInFlight = false;
+      tryStartSnapshotReconcile();
+    }
+  })();
+}
+
+function scheduleSnapshotReconcile(activeSerials, rowStates) {
+  pendingSnapshotReconcile = {
+    activeSerials: Array.isArray(activeSerials) ? activeSerials : [],
+    rowStates: Array.isArray(rowStates) ? rowStates : [],
+  };
+  tryStartSnapshotReconcile();
 }
 
 async function getTextBasedChannel(client, channelId) {
@@ -1295,7 +1350,23 @@ async function fetchTimersSnapshotFromSheetDb() {
     throw new Error("SHEETDB_URL not configured");
   }
 
-  const res = await fetch(SHEETDB_URL, { method: "GET", headers: { Accept: "application/json" } });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), SNAPSHOT_FETCH_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(SHEETDB_URL, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
+  } catch (e) {
+    if (e?.name === "AbortError") {
+      throw new Error(`SheetDB request timed out after ${SNAPSHOT_FETCH_TIMEOUT_MS}ms`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timeoutId);
+  }
   const text = await res.text();
   if (!res.ok) {
     throw new Error(`SheetDB HTTP ${res.status}: ${text.slice(0, 200)}`);
@@ -1536,6 +1607,8 @@ async function fetchTimersText(opts = {}) {
     if (!timersSnapshotRefreshPromise) {
       timersSnapshotRefreshPromise = (async () => {
         let json;
+        let source = SHEETDB_URL ? "sheetdb" : "apps_script";
+        const fetchStartedAt = Date.now();
         try {
           if (SHEETDB_URL) {
             json = await fetchTimersSnapshotFromSheetDb();
@@ -1549,15 +1622,20 @@ async function fetchTimersText(opts = {}) {
             console.error("list_timers fetch error:", e);
           }
           if (SHEETDB_URL && !isRateLimited) {
+            source = "apps_script_fallback";
             try {
               json = await postToAppsScript({ action: "list_timers" });
             } catch {}
           }
           if (!json) {
+            perfDuration("snapshot_data_fetch", fetchStartedAt, { source, error: true, rateLimited: isRateLimited });
             setTimersBackoff(isRateLimited);
             return false;
           }
         }
+
+        const fetchOk = !!json?.success;
+        perfDuration("snapshot_data_fetch", fetchStartedAt, { source, ok: fetchOk });
 
         if (!json?.success) {
           if (Date.now() - timersLastFailureAt > 10_000) {
@@ -1568,12 +1646,16 @@ async function fetchTimersText(opts = {}) {
           return false;
         }
 
+        const postProcessStartedAt = Date.now();
         timersFailureStreak = 0;
         timersNextFetchAttemptAt = 0;
         timersSnapshot = json;
         timersSnapshotAt = Date.now();
-        await reconcileDeletedReservations(json.activeSerials);
-        await reconcileReservationState(json.rowStates);
+        scheduleSnapshotReconcile(json.activeSerials, json.rowStates);
+        perfDuration("snapshot_postprocess", postProcessStartedAt, {
+          activeSerialCount: Array.isArray(json.activeSerials) ? json.activeSerials.length : 0,
+          rowStateCount: Array.isArray(json.rowStates) ? json.rowStates.length : 0,
+        });
         return true;
       })().finally(() => {
         timersSnapshotRefreshPromise = null;
@@ -1641,24 +1723,40 @@ async function refreshTimersSnapshotInBackground() {
   const startedAt = Date.now();
   try {
     const text = await fetchTimersText();
-    perfDuration("snapshot_refresh_loop", startedAt, { ok: !!text });
+    lastSnapshotRefreshDurationMs = perfDuration("snapshot_refresh_loop", startedAt, { ok: !!text });
+  } catch (e) {
+    lastSnapshotRefreshDurationMs = perfDuration("snapshot_refresh_loop", startedAt, { ok: false, error: true });
+    throw e;
   } finally {
     timersSnapshotBackgroundInFlight = false;
   }
 }
 
+function scheduleNextSnapshotRefreshTick() {
+  const delayMs = getAdaptiveSnapshotRefreshDelayMs();
+  if (timersSnapshotBackgroundIntervalId) {
+    clearTimeout(timersSnapshotBackgroundIntervalId);
+  }
+  timersSnapshotBackgroundIntervalId = setTimeout(() => {
+    refreshTimersSnapshotInBackground()
+      .catch((e) => {
+        console.error("snapshot refresh loop error:", e);
+      })
+      .finally(() => {
+        scheduleNextSnapshotRefreshTick();
+      });
+  }, delayMs);
+}
+
 function startSnapshotRefreshLoop() {
   if (timersSnapshotBackgroundIntervalId) {
-    clearInterval(timersSnapshotBackgroundIntervalId);
+    clearTimeout(timersSnapshotBackgroundIntervalId);
   }
   refreshTimersSnapshotInBackground().catch((e) => {
     console.error("snapshot warmup failed:", e);
+  }).finally(() => {
+    scheduleNextSnapshotRefreshTick();
   });
-  timersSnapshotBackgroundIntervalId = setInterval(() => {
-    refreshTimersSnapshotInBackground().catch((e) => {
-      console.error("snapshot refresh loop error:", e);
-    });
-  }, TIMERS_REFRESH_MS);
 }
 
 async function updateTimersMessage(client, channelId) {
@@ -3836,4 +3934,5 @@ client.on("error", (err) => console.error("Discord client error:", err));
 process.on("unhandledRejection", (reason) => console.error("Unhandled promise rejection:", reason));
 
 client.login(DISCORD_TOKEN);
+
 
