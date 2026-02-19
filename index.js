@@ -2818,26 +2818,37 @@ function isRetryableNetworkError(err) {
   );
 }
 
-async function postJsonWithManualRedirect(url, payload, redirectsLeft = APPS_SCRIPT_MAX_REDIRECTS) {
+async function fetchWithTimeout(url, options = {}, timeoutMs = APPS_SCRIPT_TIMEOUT_MS) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), APPS_SCRIPT_TIMEOUT_MS);
-  let res;
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: payload,
-      redirect: "manual",
-      signal: controller.signal,
-    });
+    return await fetch(url, { ...options, signal: controller.signal });
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+async function postJsonWithManualRedirect(url, payload, redirectsLeft = APPS_SCRIPT_MAX_REDIRECTS) {
+  const res = await fetchWithTimeout(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: payload,
+    redirect: "manual",
+  });
 
   if ([301, 302, 303, 307, 308].includes(res.status) && redirectsLeft > 0) {
     const location = res.headers.get("location");
     if (location) {
       const nextUrl = new URL(location, url).toString();
+      // Apps Script /exec often redirects to a one-time googleusercontent URL
+      // where the final response should be fetched with GET.
+      if ([301, 302, 303].includes(res.status)) {
+        return fetchWithTimeout(nextUrl, {
+          method: "GET",
+          headers: { Accept: "application/json,text/plain,*/*" },
+          redirect: "follow",
+        });
+      }
       return postJsonWithManualRedirect(nextUrl, payload, redirectsLeft - 1);
     }
   }
@@ -2862,7 +2873,11 @@ async function postToAppsScript(bodyObj, attempt = 0, opts = {}) {
       if (attempt < 2 && movedHrefMatch && movedHrefMatch[1]) {
         const movedUrl = movedHrefMatch[1].replace(/&amp;/g, "&");
         try {
-          const movedRes = await postJsonWithManualRedirect(movedUrl, payload);
+          const movedRes = await fetchWithTimeout(movedUrl, {
+            method: "GET",
+            headers: { Accept: "application/json,text/plain,*/*" },
+            redirect: "follow",
+          });
           const movedText = await movedRes.text();
           const movedJson = JSON.parse(movedText);
           appsScriptLastOkAt = Date.now();
