@@ -63,6 +63,7 @@ const {
   GUARDIAN_ID,
   FORM_CHANNEL_ID,
   PING_CHANNEL_ID,
+  PING_CHANNEL_BY_GUILD: PING_CHANNEL_BY_GUILD_ENV,
   REMINDER_CHANNEL_ID,
   BLOCK_BOOLEAN,
   HOURLY_RESTART,
@@ -82,11 +83,36 @@ function parseCsvIds(input) {
   );
 }
 
+function parseGuildChannelMap(input) {
+  const pairs = [];
+  for (const entry of String(input || "").split(",")) {
+    const chunk = entry.trim();
+    if (!chunk) continue;
+    const parts = chunk.split(":").map((s) => s.trim()).filter(Boolean);
+    if (parts.length !== 2) continue;
+    pairs.push([parts[0], parts[1]]);
+  }
+  return pairs;
+}
+
+const DEFAULT_PING_CHANNEL_BY_GUILD = {
+  "1423795703934877970": "1474066936328355851",
+  "1422549840990044212": "1446589241273356519",
+};
+
+const PING_CHANNEL_BY_GUILD = new Map(Object.entries(DEFAULT_PING_CHANNEL_BY_GUILD));
+for (const [guildId, channelId] of parseGuildChannelMap(PING_CHANNEL_BY_GUILD_ENV)) {
+  PING_CHANNEL_BY_GUILD.set(guildId, channelId);
+}
+
 const TARGET_GUILD_IDS = Array.from(
   new Set([...parseCsvIds(GUILD_ID), ...parseCsvIds(GUILD_IDS)])
 );
 const TARGET_PANEL_CHANNEL_IDS = Array.from(
   new Set([...parseCsvIds(PANEL_CHANNEL_ID), ...parseCsvIds(PANEL_CHANNEL_IDS)])
+);
+const TARGET_PING_CHANNEL_IDS = Array.from(
+  new Set([PING_CHANNEL_ID, ...Array.from(PING_CHANNEL_BY_GUILD.values())].filter(Boolean))
 );
 const TARGET_COMMAND_CHANNEL_IDS = parseCsvIds(COMMAND_CHANNEL_IDS);
 const COMMAND_CHANNEL_SET = new Set(TARGET_COMMAND_CHANNEL_IDS);
@@ -473,14 +499,16 @@ function persistReservationMessages() {
   writeJsonSafe(RESERVATION_MESSAGE_STORE_PATH, Object.fromEntries(reservationMessages));
 }
 
-function setReservationRequestMessage(serial, channelId, messageId) {
+function setReservationRequestMessage(serial, channelId, messageId, originGuildId = null) {
   const key = String(serial);
   const prev = reservationMessages.get(key) || {};
-  reservationMessages.set(key, {
+  const next = {
     ...prev,
     requestChannelId: String(channelId),
     requestMessageId: String(messageId),
-  });
+  };
+  if (originGuildId) next.originGuildId = String(originGuildId);
+  reservationMessages.set(key, next);
   persistReservationMessages();
 }
 
@@ -498,6 +526,24 @@ function setReservationReminderMessage(serial, channelId, messageId) {
 function clearReservationMessage(serial) {
   reservationMessages.delete(String(serial));
   persistReservationMessages();
+}
+
+function getReservationOriginGuild(serial) {
+  const ref = reservationMessages.get(String(serial)) || {};
+  if (!ref.originGuildId) return null;
+  return String(ref.originGuildId);
+}
+
+function resolvePingChannelId(originGuildId, currentGuildId) {
+  if (originGuildId) {
+    const configured = PING_CHANNEL_BY_GUILD.get(String(originGuildId));
+    if (configured) return configured;
+  }
+  if (currentGuildId) {
+    const configured = PING_CHANNEL_BY_GUILD.get(String(currentGuildId));
+    if (configured) return configured;
+  }
+  return PING_CHANNEL_ID;
 }
 
 function hasUserRecord(userId) {
@@ -2674,7 +2720,7 @@ async function runStartupChecks(client) {
   const channelChecks = [
     { name: "Panel", ids: TARGET_PANEL_CHANNEL_IDS },
     { name: "Form", ids: [FORM_CHANNEL_ID] },
-    { name: "Ping", ids: [PING_CHANNEL_ID] },
+    { name: "Ping", ids: TARGET_PING_CHANNEL_IDS },
     { name: "Reminder", ids: [REMINDER_CHANNEL_ID] },
   ];
   for (const check of channelChecks) {
@@ -3471,7 +3517,7 @@ client.on("interactionCreate", async (interaction) => {
       const content = guardianMention ? `${guardianMention}` : undefined;
 
       const sentFormMessage = await formChannel.send({ content, embeds: [embed], components: [actionRow] });
-      setReservationRequestMessage(rowSerial, sentFormMessage.channelId, sentFormMessage.id);
+      setReservationRequestMessage(rowSerial, sentFormMessage.channelId, sentFormMessage.id, interaction.guildId);
       auditLog("form_submit", {
         userId: interaction.user.id,
         rowSerial,
@@ -3680,9 +3726,11 @@ client.on("interactionCreate", async (interaction) => {
       const title = getTitleFromEmbed(interaction.message) || "Title";
       const username = getUsernameFromEmbed(interaction.message) || "Username";
       try {
-        const pingChannel = await client.channels.fetch(PING_CHANNEL_ID);
+        const originGuildId = rowSerial ? getReservationOriginGuild(rowSerial) : null;
+        const targetPingChannelId = resolvePingChannelId(originGuildId, interaction.guildId);
+        const pingChannel = await client.channels.fetch(targetPingChannelId);
         if (!pingChannel?.isTextBased()) {
-          return interaction.followUp({ flags: MessageFlags.Ephemeral, content: "❌ PING_CHANNEL_ID is not a text channel." });
+          return interaction.followUp({ flags: MessageFlags.Ephemeral, content: "❌ The configured ping channel is not a text channel." });
         }
 
         await pingChannel.send(`${mention} ${title} is on ${username}! Please refresh your game.`);
@@ -3694,6 +3742,8 @@ client.on("interactionCreate", async (interaction) => {
           username,
           guildId: interaction.guildId,
           channelId: interaction.channelId,
+          originGuildId,
+          targetPingChannelId,
         });
       } catch (e) {
         console.error("ping send error:", e);
@@ -3934,5 +3984,4 @@ client.on("error", (err) => console.error("Discord client error:", err));
 process.on("unhandledRejection", (reason) => console.error("Unhandled promise rejection:", reason));
 
 client.login(DISCORD_TOKEN);
-
 
