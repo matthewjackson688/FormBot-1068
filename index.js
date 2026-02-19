@@ -24,11 +24,11 @@
  * - { action:"clear_remind", rowSerial:"123"} -> { success:true }
  */
 
-require("dotenv").config();
+const path = require("path");
+require("dotenv").config({ path: path.join(__dirname, ".env"), quiet: true });
 const fetch = require("node-fetch");
 const { DateTime } = require("luxon");
 const fs = require("fs");
-const path = require("path");
 
 const {
   Client,
@@ -123,10 +123,17 @@ const HOURLY_RESTART_INTERVAL_MINUTES = Math.max(1, Number(HOURLY_RESTART_MINUTE
 const HOURLY_RESTART_MS = HOURLY_RESTART_INTERVAL_MINUTES * 60 * 1000;
 const BUTTON_LOGGER_ENABLED = String(BUTTON_LOGGER ?? "1").trim() === "1";
 
-if (!DISCORD_TOKEN || !CLIENT_ID || TARGET_GUILD_IDS.length === 0 || !APPS_SCRIPT_URL || TARGET_PANEL_CHANNEL_IDS.length === 0 || !FORM_CHANNEL_ID || !PING_CHANNEL_ID || !REMINDER_CHANNEL_ID) {
-  throw new Error(
-    "Missing required .env values: DISCORD_TOKEN, CLIENT_ID, GUILD_ID/GUILD_IDS, APPS_SCRIPT_URL, PANEL_CHANNEL_ID/PANEL_CHANNEL_IDS, FORM_CHANNEL_ID, PING_CHANNEL_ID, REMINDER_CHANNEL_ID"
-  );
+const missingEnvKeys = [];
+if (!DISCORD_TOKEN) missingEnvKeys.push("DISCORD_TOKEN");
+if (!CLIENT_ID) missingEnvKeys.push("CLIENT_ID");
+if (TARGET_GUILD_IDS.length === 0) missingEnvKeys.push("GUILD_ID/GUILD_IDS");
+if (!APPS_SCRIPT_URL) missingEnvKeys.push("APPS_SCRIPT_URL");
+if (TARGET_PANEL_CHANNEL_IDS.length === 0) missingEnvKeys.push("PANEL_CHANNEL_ID/PANEL_CHANNEL_IDS");
+if (!FORM_CHANNEL_ID) missingEnvKeys.push("FORM_CHANNEL_ID");
+if (!PING_CHANNEL_ID) missingEnvKeys.push("PING_CHANNEL_ID");
+if (!REMINDER_CHANNEL_ID) missingEnvKeys.push("REMINDER_CHANNEL_ID");
+if (missingEnvKeys.length > 0) {
+  throw new Error(`Missing required .env values: ${missingEnvKeys.join(", ")}`);
 }
 
 // =====================
