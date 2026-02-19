@@ -67,6 +67,7 @@ const {
   REMINDER_CHANNEL_ID,
   BLOCK_BOOLEAN,
   HOURLY_RESTART,
+  HOURLY_RESTART_MINUTES,
   BUTTON_LOGGER,
   PERF_LOGGER,
   PERF_SLOW_MS,
@@ -118,7 +119,8 @@ const TARGET_COMMAND_CHANNEL_IDS = parseCsvIds(COMMAND_CHANNEL_IDS);
 const COMMAND_CHANNEL_SET = new Set(TARGET_COMMAND_CHANNEL_IDS);
 const BLOCKS_ENABLED = String(BLOCK_BOOLEAN ?? "1").trim() === "1";
 const HOURLY_RESTART_ENABLED = String(HOURLY_RESTART ?? "0").trim() === "1";
-const HOURLY_RESTART_MS = 60 * 60 * 1000;
+const HOURLY_RESTART_INTERVAL_MINUTES = Math.max(1, Number(HOURLY_RESTART_MINUTES ?? "60") || 60);
+const HOURLY_RESTART_MS = HOURLY_RESTART_INTERVAL_MINUTES * 60 * 1000;
 const BUTTON_LOGGER_ENABLED = String(BUTTON_LOGGER ?? "1").trim() === "1";
 
 if (!DISCORD_TOKEN || !CLIENT_ID || TARGET_GUILD_IDS.length === 0 || !APPS_SCRIPT_URL || TARGET_PANEL_CHANNEL_IDS.length === 0 || !FORM_CHANNEL_ID || !PING_CHANNEL_ID || !REMINDER_CHANNEL_ID) {
@@ -148,6 +150,8 @@ const PERF_SLOW_THRESHOLD_MS = Math.max(0, Number(PERF_SLOW_MS ?? "200") || 0);
 const CONTENT_VERIFY_INTERVAL_MS = 5 * 60_000;
 const BUTTON_INTERACTION_TTL_MS = 2 * 60_000;
 const PERF_METRIC_MAX_SAMPLES = 200;
+const APPS_SCRIPT_TIMEOUT_MS = 12_000;
+const APPS_SCRIPT_MAX_REDIRECTS = 2;
 
 function readJsonSafe(filepath, fallback = {}) {
   try {
@@ -2794,6 +2798,45 @@ function isAlreadyAcknowledgedInteractionError(err) {
   return getDiscordErrorCode(err) === 40060;
 }
 
+function isRetryableNetworkError(err) {
+  if (!err) return false;
+  if (String(err?.name || "") === "AbortError") return true;
+  const code = String(err?.code || err?.errno || "").toUpperCase();
+  return (
+    code === "ETIMEDOUT" ||
+    code === "ECONNRESET" ||
+    code === "EAI_AGAIN" ||
+    code === "ECONNREFUSED" ||
+    code === "UND_ERR_CONNECT_TIMEOUT"
+  );
+}
+
+async function postJsonWithManualRedirect(url, payload, redirectsLeft = APPS_SCRIPT_MAX_REDIRECTS) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), APPS_SCRIPT_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload,
+      redirect: "manual",
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if ([301, 302, 303, 307, 308].includes(res.status) && redirectsLeft > 0) {
+    const location = res.headers.get("location");
+    if (location) {
+      const nextUrl = new URL(location, url).toString();
+      return postJsonWithManualRedirect(nextUrl, payload, redirectsLeft - 1);
+    }
+  }
+  return res;
+}
+
 async function postToAppsScript(bodyObj, attempt = 0, opts = {}) {
   const startedAt = Date.now();
   const action = (bodyObj && typeof bodyObj === "object")
@@ -2801,12 +2844,7 @@ async function postToAppsScript(bodyObj, attempt = 0, opts = {}) {
     : "unknown";
   const payload = JSON.stringify(bodyObj);
   try {
-    const res = await fetch(APPS_SCRIPT_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: payload,
-      redirect: "follow",
-    });
+    const res = await postJsonWithManualRedirect(APPS_SCRIPT_URL, payload);
     const text = await res.text();
     let json;
     try {
@@ -2817,12 +2855,7 @@ async function postToAppsScript(bodyObj, attempt = 0, opts = {}) {
       if (attempt < 2 && movedHrefMatch && movedHrefMatch[1]) {
         const movedUrl = movedHrefMatch[1].replace(/&amp;/g, "&");
         try {
-          const movedRes = await fetch(movedUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: payload,
-            redirect: "follow",
-          });
+          const movedRes = await postJsonWithManualRedirect(movedUrl, payload);
           const movedText = await movedRes.text();
           const movedJson = JSON.parse(movedText);
           appsScriptLastOkAt = Date.now();
@@ -2848,6 +2881,7 @@ async function postToAppsScript(bodyObj, attempt = 0, opts = {}) {
         /Exceeded maximum execution time/i.test(snippet) ||
         /server error occurred/i.test(snippet) ||
         /Moved Temporarily/i.test(snippet) ||
+        /Script function not found:\s*doGet/i.test(snippet) ||
         /Page not found/i.test(snippet) ||
         res.status >= 500;
       const willRetry = attempt < 4 && isRetryableHtml;
@@ -2894,8 +2928,20 @@ async function postToAppsScript(bodyObj, attempt = 0, opts = {}) {
       attempt,
       status: res.status,
     });
-    return json;
-  } catch (err) {
+      return json;
+    } catch (err) {
+    if (attempt < 4 && isRetryableNetworkError(err)) {
+      const waitMs = 500 * Math.pow(2, attempt);
+      await sleep(waitMs);
+      const retried = await postToAppsScript(bodyObj, attempt + 1, opts);
+      perfDuration("apps_script_call", startedAt, {
+        action,
+        attempt,
+        retried: true,
+        networkRetry: true,
+      });
+      return retried;
+    }
     perfDuration(
       "apps_script_call",
       startedAt,
