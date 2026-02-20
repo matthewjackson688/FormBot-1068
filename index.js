@@ -3621,11 +3621,9 @@ client.on("interactionCreate", async (interaction) => {
       const formChannel = await client.channels.fetch(FORM_CHANNEL_ID);
       const guardianMention = GUARDIAN_ID ? `<@&${GUARDIAN_ID}>` : "";
       const isTestUsername = String(username).trim() === "#TEST";
-      const requesterName = interaction.user.username;
       const contentParts = [];
       if (guardianMention && !isTestUsername) contentParts.push(guardianMention);
-      contentParts.push(`from ${requesterName}`);
-      const content = contentParts.join(" ");
+      const content = contentParts.length ? contentParts.join(" ") : undefined;
 
       const sentFormMessage = await formChannel.send({ content, embeds: [embed], components: [actionRow] });
       setReservationRequestMessage(rowSerial, sentFormMessage.channelId, sentFormMessage.id, interaction.guildId);
