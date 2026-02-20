@@ -3584,7 +3584,7 @@ client.on("interactionCreate", async (interaction) => {
       const requesterMention = `<@${interaction.user.id}>`;
       const contentParts = [];
       if (guardianMention) contentParts.push(guardianMention);
-      contentParts.push(`Requester: ${requesterMention}`);
+      contentParts.push(`from ${requesterMention}`);
       const content = contentParts.join(" ");
 
       const sentFormMessage = await formChannel.send({ content, embeds: [embed], components: [actionRow] });
