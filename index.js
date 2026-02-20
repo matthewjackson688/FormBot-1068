@@ -3582,9 +3582,10 @@ client.on("interactionCreate", async (interaction) => {
 
       const formChannel = await client.channels.fetch(FORM_CHANNEL_ID);
       const guardianMention = GUARDIAN_ID ? `<@&${GUARDIAN_ID}>` : "";
+      const isTestUsername = String(username).trim() === "#TEST";
       const requesterMention = `<@${interaction.user.id}>`;
       const contentParts = [];
-      if (guardianMention) contentParts.push(guardianMention);
+      if (guardianMention && !isTestUsername) contentParts.push(guardianMention);
       contentParts.push(`from ${requesterMention}`);
       const content = contentParts.join(" ");
 
@@ -3633,7 +3634,12 @@ client.on("interactionCreate", async (interaction) => {
           interaction.user.id
         );
         if (updatedComponents.length) {
-          await interaction.message.edit({ components: updatedComponents });
+          try {
+            await interaction.message.edit({ components: updatedComponents });
+          } catch (e) {
+            if (getDiscordErrorCode(e) !== 10008) throw e;
+            return;
+          }
           const messageId = interaction.message?.id;
           const channelId = interaction.channelId;
           const confirmIdUser = String(interaction.user.id);
