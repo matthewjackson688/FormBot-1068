@@ -3152,7 +3152,8 @@ client.on("interactionCreate", async (interaction) => {
         id.startsWith("ping_") ? "ping" :
         (id.startsWith("remove_") || id.startsWith("remove_confirm_")) ? "remove" :
         null;
-      if (action && isOnCooldown(interaction.user.id, action, 1200)) {
+      const isRemoveConfirmClick = id.startsWith("remove_confirm_");
+      if (action && !(action === "remove" && isRemoveConfirmClick) && isOnCooldown(interaction.user.id, action, 1200)) {
         return interaction.reply({ flags: MessageFlags.Ephemeral, content: "⏳ Please wait a moment and try again." });
       }
     }
