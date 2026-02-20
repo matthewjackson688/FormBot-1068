@@ -159,6 +159,7 @@ const BUTTON_INTERACTION_TTL_MS = 2 * 60_000;
 const PERF_METRIC_MAX_SAMPLES = 200;
 const APPS_SCRIPT_TIMEOUT_MS = 12_000;
 const APPS_SCRIPT_MAX_REDIRECTS = 2;
+const TEST_DISCORD_SUFFIX_EMOJI = "<:cornershaking:1474243561506734121>";
 
 function readJsonSafe(filepath, fallback = {}) {
   try {
@@ -3600,7 +3601,7 @@ client.on("interactionCreate", async (interaction) => {
       const rowSerial = String(jsonResponse.serial);
       setReservationOwner(rowSerial, interaction.user.id);
       const isTestUsername = String(username).trim() === "#TEST";
-      const displayDiscordUsername = `${interaction.user.username}${isTestUsername ? " :Cat_Liked:" : ""}`;
+      const displayDiscordUsername = `${interaction.user.username}${isTestUsername ? ` ${TEST_DISCORD_SUFFIX_EMOJI}` : ""}`;
 
       const embed = new EmbedBuilder()
         .setTitle("📋 New Title Request")
