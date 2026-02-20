@@ -3599,20 +3599,22 @@ client.on("interactionCreate", async (interaction) => {
 
       const rowSerial = String(jsonResponse.serial);
       setReservationOwner(rowSerial, interaction.user.id);
+      const isTestUsername = String(username).trim() === "#TEST";
+      const displayDiscordUsername = `${interaction.user.username}${isTestUsername ? " :Cat_Liked:" : ""}`;
 
       const embed = new EmbedBuilder()
         .setTitle("📋 New Title Request")
         .addFields(
-          { name: "Discord", value: interaction.user.username, inline: true },
-          { name: "Username", value: username, inline: true },
-          { name: "Coordinates", value: coords, inline: true },
-          { name: "Title", value: titleShort, inline: true },
-          { name: "Reservation (UTC)", value: reservation, inline: true }
+          { name: "👤 Discord", value: displayDiscordUsername, inline: true },
+          { name: "🎮 Username", value: username, inline: true },
+          { name: "📍 Coordinates", value: coords, inline: true },
+          { name: "🏷️ Title", value: titleShort, inline: true },
+          { name: "🕒 Reservation (UTC)", value: reservation, inline: true }
         )
         .setColor(0x00ff00);
 
       if (comments.trim()) {
-        embed.addFields({ name: "Comments", value: comments.slice(0, 1024), inline: false });
+        embed.addFields({ name: "📝 Comments", value: comments.slice(0, 1024), inline: false });
       }
 
       // Default: Remind is available (arm mode) only if reservation exists
@@ -3620,7 +3622,6 @@ client.on("interactionCreate", async (interaction) => {
 
       const formChannel = await client.channels.fetch(FORM_CHANNEL_ID);
       const guardianMention = GUARDIAN_ID ? `<@&${GUARDIAN_ID}>` : "";
-      const isTestUsername = String(username).trim() === "#TEST";
       const contentParts = [];
       if (guardianMention && !isTestUsername) contentParts.push(guardianMention);
       const content = contentParts.length ? contentParts.join(" ") : undefined;
