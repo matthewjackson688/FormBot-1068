@@ -1461,6 +1461,24 @@ async function fetchTimersSnapshotFromSheetDb() {
     const reminder = parseBool(getRowValue(row, ["Reminder", "REMINDER", "reminder"]));
     const username = String(getRowValue(row, ["Username", "USERNAME", "username"]) || "").trim();
     const coordinates = String(getRowValue(row, ["Coordinates", "COORDINATES", "coordinates"]) || "").trim();
+    const madeAtUtc = String(
+      getRowValue(row, [
+        "Made At (UTC)",
+        "madeAtUtc",
+        "made_at_utc",
+        "Requested At (UTC)",
+        "requestedAtUtc",
+        "requested_at_utc",
+        "Created At (UTC)",
+        "createdAtUtc",
+        "created_at_utc",
+        "Timestamp (UTC)",
+        "timestampUtc",
+        "timestamp_utc",
+        "Timestamp",
+        "timestamp",
+      ]) || ""
+    ).trim();
 
     if (Number.isFinite(serial)) {
       rowStates.push({
@@ -1471,6 +1489,7 @@ async function fetchTimersSnapshotFromSheetDb() {
         done,
         username,
         coordinates,
+        madeAtUtc,
       });
     }
 
@@ -1583,6 +1602,68 @@ function formatReservationForUserTimezone(reservationUtcStr, tz) {
   }
 
   return `${reservationUtcStr} (UTC)`;
+}
+
+function parseAnyTimestampMs(value) {
+  if (value == null) return null;
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return null;
+    return value > 1e12 ? value : value * 1000;
+  }
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  if (/^\d+$/.test(raw)) {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return null;
+    return n > 1e12 ? n : n * 1000;
+  }
+
+  const utcFmt = parseReservationUTC(raw);
+  if (utcFmt) return utcFmt.getTime();
+
+  const dmyHm = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})$/);
+  if (dmyHm) {
+    const dd = Number(dmyHm[1]);
+    const MM = Number(dmyHm[2]);
+    const yyyy = Number(dmyHm[3]);
+    const hh = Number(dmyHm[4]);
+    const mm = Number(dmyHm[5]);
+    const ms = Date.UTC(yyyy, MM - 1, dd, hh, mm, 0, 0);
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  const parsedMs = Date.parse(raw);
+  return Number.isFinite(parsedMs) ? parsedMs : null;
+}
+
+function getOutstandingMadeAtMs(item) {
+  if (!item || typeof item !== "object") return null;
+  const keys = [
+    "madeAtUtc",
+    "madeAt",
+    "requestedAtUtc",
+    "requestedAt",
+    "submittedAtUtc",
+    "submittedAt",
+    "createdAtUtc",
+    "createdAt",
+    "created_at",
+    "timestampUtc",
+    "timestamp",
+    "ts",
+    "date",
+  ];
+  for (const key of keys) {
+    if (!(key in item)) continue;
+    const ms = parseAnyTimestampMs(item[key]);
+    if (Number.isFinite(ms)) return ms;
+  }
+  return null;
 }
 
 function renderTimersTextFromSnapshot() {
@@ -3401,20 +3482,50 @@ client.on("interactionCreate", async (interaction) => {
         const serial = r?.serial ?? r?.row;
         return getReservationOwner(serial) === discordId;
       });
+      const bySerial = new Map(
+        items
+          .map((r) => [String(r?.serial ?? r?.row ?? ""), r])
+          .filter(([serial]) => !!serial)
+      );
+      const snapshotRows = Array.isArray(timersSnapshot?.rowStates) ? timersSnapshot.rowStates : [];
+      for (const rowState of snapshotRows) {
+        const serial = String(rowState?.serial || "");
+        if (!serial) continue;
+        if (bySerial.has(serial)) continue;
+        if (getReservationOwner(serial) !== discordId) continue;
+        if (!!rowState.done) continue;
+        const reservationUtc = String(rowState.reservationUtc || "—").trim() || "—";
+        if (reservationUtc !== "—") continue;
+        bySerial.set(serial, {
+          serial,
+          title: rowState.title,
+          reservationUtc,
+          madeAtUtc: rowState.madeAtUtc,
+          createdAtUtc: rowState.createdAtUtc,
+          submittedAtUtc: rowState.submittedAtUtc,
+        });
+      }
+      const mergedItems = Array.from(bySerial.values());
       const embed = new EmbedBuilder()
         .setTitle("Your Outstanding Reservations")
         .setColor(0x5865f2);
 
-      if (!items.length) {
+      if (!mergedItems.length) {
         embed.setDescription(js.message || "No reservations found for this user");
         return interaction.editReply({ embeds: [embed], components: [buildReservationsRefreshRow()] });
       }
 
-      const lines = items.slice(0, 25).map((r) => {
+      const lines = mergedItems.slice(0, 25).map((r) => {
         const title = String(r.title || "Title");
-        const reservationUtc = String(r.reservationUtc || "—");
+        const reservationUtc = String(r.reservationUtc || "—").trim() || "—";
         const tz = getUserTimezone(interaction.user.id);
-        return `${title} — ${formatReservationForUserTimezone(reservationUtc, tz)}`;
+        if (reservationUtc !== "—") {
+          return `${title} — ${formatReservationForUserTimezone(reservationUtc, tz)}`;
+        }
+        const madeAtMs = getOutstandingMadeAtMs(r);
+        if (!Number.isFinite(madeAtMs)) return `${title} — ASAP`;
+        const madeAtUtc = formatUTCDateTime(new Date(madeAtMs));
+        return `${title} — ASAP made at ${formatReservationForUserTimezone(madeAtUtc, tz)}`;
       });
 
       embed.setDescription(lines.join("\n").slice(0, 4000));
