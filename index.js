@@ -1666,6 +1666,17 @@ function getOutstandingMadeAtMs(item) {
   return null;
 }
 
+function getReservationUsername(item) {
+  if (!item || typeof item !== "object") return "Unknown";
+  const keys = ["username", "Username", "player", "name"];
+  for (const key of keys) {
+    const raw = item[key];
+    const value = String(raw ?? "").trim();
+    if (value) return value;
+  }
+  return "Unknown";
+}
+
 function renderTimersTextFromSnapshot() {
   if (!timersSnapshot) return null;
   const ageSeconds = Math.max(0, Math.floor((Date.now() - timersSnapshotAt) / 1000));
@@ -3520,16 +3531,29 @@ client.on("interactionCreate", async (interaction) => {
         const reservationUtc = String(r.reservationUtc || "—").trim() || "—";
         const tz = getUserTimezone(interaction.user.id);
         if (reservationUtc !== "—") {
-          return `${title} — ${formatReservationForUserTimezone(reservationUtc, tz)}`;
+          return {
+            username: getReservationUsername(r),
+            line: `${title} — ${formatReservationForUserTimezone(reservationUtc, tz)}`,
+          };
         }
-        const madeAtMs = getOutstandingMadeAtMs(r);
-        if (!Number.isFinite(madeAtMs)) return `${title} — ASAP`;
-        const madeAtUtc = formatUTCDateTime(new Date(madeAtMs));
-        return `${title} — ASAP made at ${formatReservationForUserTimezone(madeAtUtc, tz)}`;
+        return {
+          username: getReservationUsername(r),
+          line: `${title} — ASAP`,
+        };
       });
 
-      embed.setDescription(lines.join("\n").slice(0, 4000));
-      embed.setFooter({ text: `User: ${interaction.user.tag}` });
+      const grouped = new Map();
+      for (const entry of lines) {
+        if (!entry || !entry.username || !entry.line) continue;
+        if (!grouped.has(entry.username)) grouped.set(entry.username, []);
+        grouped.get(entry.username).push(entry.line);
+      }
+      const sections = [];
+      for (const [username, entries] of grouped.entries()) {
+        sections.push(`**${username}**`);
+        sections.push(...entries);
+      }
+      embed.setDescription(sections.join("\n\n").slice(0, 4000));
       return interaction.editReply({ embeds: [embed], components: [buildReservationsRefreshRow()] });
     }
 
