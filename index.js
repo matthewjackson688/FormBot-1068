@@ -3565,8 +3565,7 @@ client.on("interactionCreate", async (interaction) => {
       }
       const sections = [];
       for (const [username, entries] of grouped.entries()) {
-        sections.push(`**${username}**`);
-        sections.push(entries.join("\n"));
+        sections.push(`**${username}**\n${entries.join("\n")}`);
       }
       embed.setDescription(sections.join("\n\n").slice(0, 4000));
       return interaction.editReply({ embeds: [embed], components: [buildReservationsRefreshRow()] });
