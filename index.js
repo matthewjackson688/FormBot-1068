@@ -1996,10 +1996,8 @@ function getEffectiveDoneState(serial, sheetDone) {
   const sheetDoneBool = !!sheetDone;
   const override = getDoneStateOverride(serial);
   if (!override) return sheetDoneBool;
-  if (override.done === sheetDoneBool) {
-    doneStateOverrides.delete(String(serial));
-    return sheetDoneBool;
-  }
+  // Keep override for its full TTL to absorb stale/out-of-order snapshot rows.
+  // This prevents brief UI reverts right after a successful done toggle.
   return override.done;
 }
 
@@ -4103,4 +4101,5 @@ client.on("error", (err) => console.error("Discord client error:", err));
 process.on("unhandledRejection", (reason) => console.error("Unhandled promise rejection:", reason));
 
 client.login(DISCORD_TOKEN);
+
 
