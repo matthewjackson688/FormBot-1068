@@ -1668,7 +1668,7 @@ function getOutstandingMadeAtMs(item) {
 
 function getReservationUsername(item) {
   if (!item || typeof item !== "object") return "Unknown";
-  const keys = ["username", "Username", "player", "name"];
+  const keys = ["username", "Username", "userName", "player", "name"];
   for (const key of keys) {
     const raw = item[key];
     const value = String(raw ?? "").trim();
@@ -3493,12 +3493,26 @@ client.on("interactionCreate", async (interaction) => {
         const serial = r?.serial ?? r?.row;
         return getReservationOwner(serial) === discordId;
       });
+      const rowStateBySerial = new Map(
+        (Array.isArray(timersSnapshot?.rowStates) ? timersSnapshot.rowStates : [])
+          .map((rowState) => [String(rowState?.serial || ""), rowState])
+          .filter(([serial]) => !!serial)
+      );
+      for (const item of items) {
+        const serial = String(item?.serial ?? item?.row ?? "");
+        if (!serial) continue;
+        const rowState = rowStateBySerial.get(serial);
+        const existingUsername = String(item?.username ?? item?.Username ?? item?.userName ?? "").trim();
+        if (!existingUsername && rowState?.username) {
+          item.username = String(rowState.username).trim();
+        }
+      }
       const bySerial = new Map(
         items
           .map((r) => [String(r?.serial ?? r?.row ?? ""), r])
           .filter(([serial]) => !!serial)
       );
-      const snapshotRows = Array.isArray(timersSnapshot?.rowStates) ? timersSnapshot.rowStates : [];
+      const snapshotRows = Array.from(rowStateBySerial.values());
       for (const rowState of snapshotRows) {
         const serial = String(rowState?.serial || "");
         if (!serial) continue;
@@ -3510,6 +3524,7 @@ client.on("interactionCreate", async (interaction) => {
         bySerial.set(serial, {
           serial,
           title: rowState.title,
+          username: String(rowState.username || "").trim(),
           reservationUtc,
           madeAtUtc: rowState.madeAtUtc,
           createdAtUtc: rowState.createdAtUtc,
