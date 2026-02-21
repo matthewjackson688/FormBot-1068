@@ -697,11 +697,96 @@ function parseTime(input) {
   return `${pad(h)}:${pad(min)}`;
 }
 
+function isExplicitImmediateTimeInput(input) {
+  const raw = String(input || "").trim().toLowerCase();
+  return raw === "now" || raw === "asap" || raw === "none";
+}
+
 function parseTimeParts(input) {
   const t = parseTime(input);
   if (!t) return null;
   const [hh, mm] = t.split(":").map(Number);
   return { hh, mm, hhmm: t };
+}
+
+const TIMEZONE_ABBR_OFFSETS = {
+  UTC: 0,
+  GMT: 0,
+  BST: 60,
+  CET: 60,
+  CEST: 120,
+  EET: 120,
+  EEST: 180,
+  MSK: 180,
+  GST: 240,
+  AZOT: -60,
+  ART: -180,
+  AST: -240,
+  EDT: -240,
+  EST: -300,
+  CDT: -300,
+  CST: -360,
+  MDT: -360,
+  MST: -420,
+  PDT: -420,
+  PST: -480,
+  AKDT: -480,
+  AKST: -540,
+  HST: -600,
+  AEST: 600,
+  AEDT: 660,
+  ACST: 570,
+  ACDT: 630,
+  AWST: 480,
+  JST: 540,
+  KST: 540,
+  IST: 330,
+};
+
+function parseTimezoneOverrideFromTime(rawTime) {
+  const raw = String(rawTime || "").trim();
+  if (!raw) return { cleanedTime: "", tzOverride: null };
+
+  // IANA tz suffix: "3:30pm America/Chicago"
+  let m = raw.match(/\s+([A-Za-z_]+\/[A-Za-z_]+)$/);
+  if (m) {
+    const zone = String(m[1] || "").trim();
+    if (zone && DateTime.now().setZone(zone).isValid) {
+      return { cleanedTime: raw.slice(0, m.index).trim(), tzOverride: { type: "iana", zone } };
+    }
+  }
+
+  // UTC/GMT offset suffixes: "3:30pm UTC+2", "3:30pmUTC-0530", "3:30pm GMT+05:30"
+  m = raw.match(/\s*(UTC|GMT)\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?$/i);
+  if (m) {
+    const sign = m[2] === "-" ? -1 : 1;
+    const hh = Number(m[3] || 0);
+    const mm = Number(m[4] || 0);
+    if (hh <= 14 && mm <= 59) {
+      const offsetMinutes = sign * (hh * 60 + mm);
+      return { cleanedTime: raw.slice(0, m.index).trim(), tzOverride: { type: "offset", offsetMinutes } };
+    }
+  }
+
+  // UTC/GMT literal suffix: "3:30pm UTC", "3:30pmUTC"
+  m = raw.match(/\s*(UTC|GMT)$/i);
+  if (m) {
+    return { cleanedTime: raw.slice(0, m.index).trim(), tzOverride: { type: "offset", offsetMinutes: 0 } };
+  }
+
+  // Abbreviation suffix: "3:30pm CST"
+  m = raw.match(/\s+([A-Za-z]{2,5})$/);
+  if (m) {
+    const abbr = String(m[1] || "").toUpperCase();
+    if (Object.prototype.hasOwnProperty.call(TIMEZONE_ABBR_OFFSETS, abbr)) {
+      return {
+        cleanedTime: raw.slice(0, m.index).trim(),
+        tzOverride: { type: "offset", offsetMinutes: TIMEZONE_ABBR_OFFSETS[abbr] },
+      };
+    }
+  }
+
+  return { cleanedTime: raw, tzOverride: null };
 }
 
 function parseDateParts(input, tz) {
@@ -897,6 +982,8 @@ function parseDateParts(input, tz) {
  * Reservation rules:
  * - now/asap => "—"
  * - none => "—"
+ * - optional timezone suffix in time field overrides saved timezone:
+ *   e.g. "3:30pm CST", "3:30pm UTC", "3:30pmUTC+2", "3:30pm Europe/London"
  * - date only => local 00:00 on that date -> UTC
  * - time only => local today at time, but if passed in USER local -> tomorrow
  * - both => local date+time -> UTC
@@ -904,10 +991,11 @@ function parseDateParts(input, tz) {
 function buildReservation(rawTime, rawDate, tz) {
   const rt = (rawTime || "").trim().toLowerCase();
   if (rt === "now" || rt === "asap") return "—";
-  const timeExplicitUtc = /\butc\b/i.test(String(rawTime || ""));
-  const effectiveTz = timeExplicitUtc ? { type: "offset", offsetMinutes: 0 } : tz;
+  const timeParsed = parseTimezoneOverrideFromTime(rawTime);
+  const timeInput = timeParsed.cleanedTime;
+  const effectiveTz = timeParsed.tzOverride || tz;
 
-  const timeP = parseTimeParts(rawTime);
+  const timeP = parseTimeParts(timeInput);
   const dateP = parseDateParts(rawDate, effectiveTz);
 
   if (!timeP && !dateP) return "—";
@@ -3674,9 +3762,16 @@ client.on("interactionCreate", async (interaction) => {
 
       const rawTime = interaction.fields.getTextInputValue("reservation_time") || "";
       const rawDate = interaction.fields.getTextInputValue("reservation_date") || "";
-      const requestedNow = ["now", "asap"].includes(String(rawTime).trim().toLowerCase());
+      const requestedNow = isExplicitImmediateTimeInput(rawTime);
 
       const reservation = buildReservation(rawTime, rawDate, tz);
+      const hasScheduleInput = String(rawTime).trim() !== "" || String(rawDate).trim() !== "";
+      if (hasScheduleInput && !requestedNow && reservation === "—") {
+        pendingTitleByUser.delete(interaction.user.id);
+        return interaction.editReply(
+          "❌ I couldn't parse your reservation time/date. Use formats like `14:30`, `1pm`, `tomorrow`, or `21/02`."
+        );
+      }
       const titleShort = pending.value;
 
       const isImmediateRequest = requestedNow || reservation === "—";
