@@ -1099,6 +1099,7 @@ const reservationsMessageByChannel = new Map(); // channelId -> { messageId, int
 const interactionCooldowns = new Map(); // key -> expiresAtMs
 const doneToggleInFlight = new Set(); // rowSerial keys currently toggling done/not done
 const doneStateOverrides = new Map(); // rowSerial -> { done, expiresAt }
+const pingHiddenByRow = new Map(); // rowSerial -> true when ping was already used for current done cycle
 const LIVE_MESSAGE_REFRESH_MS = 15_000;
 let startupStickyDelayUntil = 0;
 let lastTimersText = null;
@@ -2201,6 +2202,14 @@ function getEffectiveDoneState(serial, sheetDone) {
   return override.done;
 }
 
+function setPingHiddenState(serial, hidden) {
+  pingHiddenByRow.set(String(serial), !!hidden);
+}
+
+function isPingHidden(serial) {
+  return pingHiddenByRow.get(String(serial)) === true;
+}
+
 async function reconcileReservationState(rowStates) {
   if (reservationStateSyncInFlight) return;
   if (!Array.isArray(rowStates) || !runtimeClient) return;
@@ -2226,12 +2235,23 @@ async function reconcileReservationState(rowStates) {
       const completed = getEffectiveDoneState(serial, rowState.done);
       const reminderEnabled = !!rowState.reminder && reservationStr !== "—" && !completed;
       const currentIds = parseCurrentCustomIds(requestMsg);
-      const showPing = currentIds.some((id) => id.startsWith("ping_"));
+      const hasPingButtonNow = currentIds.some((id) => id.startsWith("ping_"));
+      if (!completed) {
+        setPingHiddenState(serial, false);
+      } else if (!hasPingButtonNow) {
+        setPingHiddenState(serial, true);
+      } else if (!pingHiddenByRow.has(String(serial))) {
+        setPingHiddenState(serial, false);
+      }
+      const showPing = !isPingHidden(serial);
       const removeConfirm = currentIds.some((id) => id.startsWith("remove_confirm_"));
       const pingUserId = getDiscordUserIdFromEmbed(requestMsg) || getReservationOwner(serial);
 
       const existingEmbed = requestMsg.embeds?.[0] || null;
-      const embed = existingEmbed ? EmbedBuilder.from(existingEmbed) : new EmbedBuilder().setTitle("📋 New Title Request");
+      const rowUsername = String(rowState.username || "").trim();
+      const embed = existingEmbed
+        ? EmbedBuilder.from(existingEmbed)
+        : new EmbedBuilder().setTitle(rowUsername === "#TEST" ? "📋 TEST" : "📋 New Title Request");
       const fields = (existingEmbed?.fields || []).map((f) => ({ name: f.name, value: f.value, inline: f.inline }));
       if (String(rowState.username || "").trim()) {
         upsertEmbedField(fields, "Username", String(rowState.username).trim(), true);
@@ -2390,7 +2410,7 @@ async function updateOriginalRequestFromReminder(client, reminderMessage, rowSer
     base.setColor(0x00ff00).setFooter(null);
   }
 
-  const showPing = typeof showPingOverride === "boolean" ? showPingOverride : true;
+  const showPing = typeof showPingOverride === "boolean" ? showPingOverride : !isPingHidden(rowSerial);
   const updatedRow = buildRequestActionRow(rowSerial, reservationStr, "arm", completed, pingUserId, showPing);
   await msg.edit({ embeds: [base], components: [updatedRow] });
   return true;
@@ -2409,7 +2429,8 @@ async function updateReminderMessagePingVisibility(client, rowSerial, showPing, 
   return true;
 }
 
-async function syncLinkedDoneState(client, sourceMessage, rowSerial, completed, showPing = true) {
+async function syncLinkedDoneState(client, sourceMessage, rowSerial, completed, showPingOverride) {
+  const showPing = typeof showPingOverride === "boolean" ? showPingOverride : !isPingHidden(rowSerial);
   if (isReminderMessage(sourceMessage)) {
     return updateOriginalRequestFromReminder(client, sourceMessage, rowSerial, completed, showPing);
   }
@@ -2462,7 +2483,7 @@ async function postReminder({ client, channelId, rowSerial, title, username, coo
           const completed = getCompletedFromEmbed(sourceMsg);
           const reservation = getReservationFromEmbed(sourceMsg);
           const pingUserId = resolvePingUserId(sourceMsg, rowSerial);
-          const updatedRow = buildRequestActionRow(rowSerial, reservation, "arm", completed, pingUserId, true);
+          const updatedRow = buildRequestActionRow(rowSerial, reservation, "arm", completed, pingUserId, !isPingHidden(rowSerial));
           await sourceMsg.edit({ components: [updatedRow] });
         }
       } catch (e) {
@@ -3776,7 +3797,9 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       const username = interaction.fields.getTextInputValue("username");
-      const coords = normalizeCoords(interaction.fields.getTextInputValue("coordinates"));
+      const isTestUsername = String(username).trim() === "#TEST";
+      const normalizedCoords = normalizeCoords(interaction.fields.getTextInputValue("coordinates"));
+      const coords = isTestUsername ? "#TEST" : normalizedCoords;
       setUserPrefill(interaction.user.id, username, coords);
       const comments = interaction.fields.getTextInputValue("comments") || "";
 
@@ -3869,11 +3892,10 @@ client.on("interactionCreate", async (interaction) => {
 
       const rowSerial = String(jsonResponse.serial);
       setReservationOwner(rowSerial, interaction.user.id);
-      const isTestUsername = String(username).trim() === "#TEST";
       const displayDiscordUsername = `${interaction.user.username}${isTestUsername ? ` ${TEST_DISCORD_SUFFIX_EMOJI}` : ""}`;
 
       const embed = new EmbedBuilder()
-        .setTitle("📋 New Title Request")
+        .setTitle(isTestUsername ? "📋 TEST" : "📋 New Title Request")
         .addFields(
           { name: "👤 Discord", value: displayDiscordUsername, inline: true },
           { name: "🎮 Username", value: username, inline: true },
@@ -3984,6 +4006,7 @@ client.on("interactionCreate", async (interaction) => {
       const meta = reminderMeta.get(String(rowSerial));
       cancelReminder(rowSerial);
       doneStateOverrides.delete(String(rowSerial));
+      pingHiddenByRow.delete(String(rowSerial));
       if (reservationOwners.has(String(rowSerial))) {
         reservationOwners.delete(String(rowSerial));
         persistReservationOwners();
@@ -4049,7 +4072,7 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.message.edit({ components: [updatedRow] });
       } else {
         const pingUserId = resolvePingUserId(interaction.message, rowSerial);
-        const updatedRow = buildRequestActionRow(rowSerial, reservationStr, "arm", completed, pingUserId, true);
+        const updatedRow = buildRequestActionRow(rowSerial, reservationStr, "arm", completed, pingUserId, !isPingHidden(rowSerial));
         await interaction.message.edit({ components: [updatedRow] });
       }
 
@@ -4080,6 +4103,7 @@ client.on("interactionCreate", async (interaction) => {
       const mention = `<@${pingUserId}>`;
 
       const completed = getCompletedFromEmbed(interaction.message);
+      if (rowSerial) setPingHiddenState(rowSerial, true);
 
       // Remove Ping button immediately to prevent spam
       try {
@@ -4164,7 +4188,7 @@ client.on("interactionCreate", async (interaction) => {
       // Optimistic UI: flip to "Cancel Remind" immediately
       const completed = getCompletedFromEmbed(interaction.message);
       const pingUserId = resolvePingUserId(interaction.message, rowSerial);
-      const optimisticRow = buildRequestActionRow(rowSerial, reservationStr, "cancel", completed, pingUserId, true);
+      const optimisticRow = buildRequestActionRow(rowSerial, reservationStr, "cancel", completed, pingUserId, !isPingHidden(rowSerial));
       const previousComponents = interaction.message.components;
       try {
         await interaction.message.edit({ components: [optimisticRow] });
@@ -4232,6 +4256,11 @@ client.on("interactionCreate", async (interaction) => {
         const previousComponents = interaction.message.components;
         const wasCompleted = getCompletedFromEmbed(interaction.message);
         const optimisticCompleted = !wasCompleted;
+        if (!optimisticCompleted) {
+          setPingHiddenState(rowSerial, false);
+        } else if (!wasCompleted) {
+          setPingHiddenState(rowSerial, false);
+        }
         const isReminder = isReminderMessage(interaction.message);
 
         // Optimistic UI update
@@ -4244,11 +4273,11 @@ client.on("interactionCreate", async (interaction) => {
           optimisticBase.setColor(0x00ff00).setFooter(null);
         }
         const optimisticRow = isReminder
-          ? buildReminderActionRow(rowSerial, optimisticCompleted, resolvePingUserId(interaction.message, rowSerial, pingUserIdFromCustom), true)
+          ? buildReminderActionRow(rowSerial, optimisticCompleted, resolvePingUserId(interaction.message, rowSerial, pingUserIdFromCustom), !isPingHidden(rowSerial))
           : (() => {
               const optimisticReservation = getReservationFromEmbed(interaction.message);
               const pingUserId = resolvePingUserId(interaction.message, rowSerial, pingUserIdFromCustom);
-              return buildRequestActionRow(rowSerial, optimisticReservation, "arm", optimisticCompleted, pingUserId, true);
+              return buildRequestActionRow(rowSerial, optimisticReservation, "arm", optimisticCompleted, pingUserId, !isPingHidden(rowSerial));
             })();
         const ackStartedAt = Date.now();
         let interactionAcked = false;
@@ -4271,7 +4300,7 @@ client.on("interactionCreate", async (interaction) => {
         }
         if (!interactionAcked) return;
 
-        syncLinkedDoneState(client, interaction.message, rowSerial, optimisticCompleted, true)
+        syncLinkedDoneState(client, interaction.message, rowSerial, optimisticCompleted, !isPingHidden(rowSerial))
           .catch((e) => console.error("Failed to optimistically sync linked message:", e));
 
         const reminderKey = String(rowSerial);
@@ -4290,7 +4319,7 @@ client.on("interactionCreate", async (interaction) => {
           if (previousEmbeds?.length && previousComponents?.length) {
             await interaction.message.edit({ embeds: previousEmbeds, components: previousComponents });
           }
-          await syncLinkedDoneState(client, interaction.message, rowSerial, wasCompleted, true)
+          await syncLinkedDoneState(client, interaction.message, rowSerial, wasCompleted, !isPingHidden(rowSerial))
             .catch((syncErr) => console.error("Failed to rollback linked message after done error:", syncErr));
           return;
         }
@@ -4300,13 +4329,18 @@ client.on("interactionCreate", async (interaction) => {
           if (previousEmbeds?.length && previousComponents?.length) {
             await interaction.message.edit({ embeds: previousEmbeds, components: previousComponents });
           }
-          await syncLinkedDoneState(client, interaction.message, rowSerial, wasCompleted, true)
+          await syncLinkedDoneState(client, interaction.message, rowSerial, wasCompleted, !isPingHidden(rowSerial))
             .catch((syncErr) => console.error("Failed to rollback linked message after done failure:", syncErr));
           return;
         }
 
         const completed = !!json.done;
         setDoneStateOverride(rowSerial, completed);
+        if (!completed) {
+          setPingHiddenState(rowSerial, false);
+        } else if (!wasCompleted) {
+          setPingHiddenState(rowSerial, false);
+        }
 
         if (!optimisticApplied || completed !== optimisticCompleted) {
           const base = interaction.message.embeds?.[0]
@@ -4320,11 +4354,11 @@ client.on("interactionCreate", async (interaction) => {
           }
 
           const row = isReminder
-            ? buildReminderActionRow(rowSerial, completed, resolvePingUserId(interaction.message, rowSerial, pingUserIdFromCustom), true)
+            ? buildReminderActionRow(rowSerial, completed, resolvePingUserId(interaction.message, rowSerial, pingUserIdFromCustom), !isPingHidden(rowSerial))
             : (() => {
                 const reservationStr = getReservationFromEmbed(interaction.message);
                 const pingUserId = resolvePingUserId(interaction.message, rowSerial, pingUserIdFromCustom);
-                return buildRequestActionRow(rowSerial, reservationStr, "arm", completed, pingUserId, true);
+                return buildRequestActionRow(rowSerial, reservationStr, "arm", completed, pingUserId, !isPingHidden(rowSerial));
               })();
 
           await interaction.message.edit({ embeds: [base], components: [row] });
@@ -4339,7 +4373,7 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         try {
-          await syncLinkedDoneState(client, interaction.message, rowSerial, completed, true);
+          await syncLinkedDoneState(client, interaction.message, rowSerial, completed, !isPingHidden(rowSerial));
         } catch (e) {
           console.error("Failed to sync linked message from done toggle:", e);
         }
@@ -4372,6 +4406,7 @@ client.on("error", (err) => console.error("Discord client error:", err));
 process.on("unhandledRejection", (reason) => console.error("Unhandled promise rejection:", reason));
 
 client.login(DISCORD_TOKEN);
+
 
 
 
