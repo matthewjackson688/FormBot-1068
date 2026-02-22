@@ -147,6 +147,7 @@ const RESERVATIONS_STORE_PATH = path.join(__dirname, "reservations-messages.json
 const RESERVATION_OWNER_STORE_PATH = path.join(__dirname, "reservation-owners.json");
 const RESERVATION_MESSAGE_STORE_PATH = path.join(__dirname, "reservation-messages.json");
 const AUDIT_LOG_PATH = path.join(__dirname, "audit.log");
+const REQUEST_LOG_PATH = path.join(__dirname, "request.log");
 const BUTTON_LOG_PATH = path.join(__dirname, "button-logs.ndjson");
 const PERF_LOG_PATH = path.join(__dirname, "perf.log");
 const TIMERS_CACHE_MAX_AGE_MS = 60_000;
@@ -385,6 +386,25 @@ function auditLog(event, data = {}) {
   try {
     const line = JSON.stringify({ ts: new Date().toISOString(), event, ...data });
     appendLineBuffered(AUDIT_LOG_PATH, `${line}\n`);
+  } catch {}
+}
+
+function cleanRequestLogField(value) {
+  const s = String(value ?? "").replace(/\r?\n/g, " ").trim();
+  return s || "—";
+}
+
+function logRequestLine({ username, rawTime, rawDate, reservation }) {
+  try {
+    const timeMade = `${formatUTCDateTime(new Date())} UTC`;
+    const line = [
+      cleanRequestLogField(timeMade),
+      cleanRequestLogField(username),
+      cleanRequestLogField(rawTime),
+      cleanRequestLogField(rawDate),
+      cleanRequestLogField(reservation),
+    ].join(", ");
+    appendLineBuffered(REQUEST_LOG_PATH, `${line}\n`);
   } catch {}
 }
 
@@ -3840,6 +3860,13 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply("❌ Failed to submit to Google Sheets.");
       }
 
+      logRequestLine({
+        username,
+        rawTime,
+        rawDate,
+        reservation,
+      });
+
       const rowSerial = String(jsonResponse.serial);
       setReservationOwner(rowSerial, interaction.user.id);
       const isTestUsername = String(username).trim() === "#TEST";
@@ -4345,5 +4372,6 @@ client.on("error", (err) => console.error("Discord client error:", err));
 process.on("unhandledRejection", (reason) => console.error("Unhandled promise rejection:", reason));
 
 client.login(DISCORD_TOKEN);
+
 
 
