@@ -1568,6 +1568,7 @@ async function fetchTimersSnapshotFromSheetDb() {
     const done = parseBool(getRowValue(row, ["Done", "DONE", "done"]));
     const reservationRaw = String(getRowValue(row, ["Reservation (UTC)", "RESERVATION (UTC)", "reservationUtc", "reservation_utc"]) || "").trim();
     const reminder = parseBool(getRowValue(row, ["Reminder", "REMINDER", "reminder"]));
+    const pingUsed = parseBool(getRowValue(row, ["Ping Used", "PING_USED", "pingUsed", "ping_used"]));
     const username = String(getRowValue(row, ["Username", "USERNAME", "username"]) || "").trim();
     const coordinates = String(getRowValue(row, ["Coordinates", "COORDINATES", "coordinates"]) || "").trim();
     const madeAtUtc = String(
@@ -1595,6 +1596,7 @@ async function fetchTimersSnapshotFromSheetDb() {
         title,
         reservationUtc: reservationRaw || "—",
         reminder,
+        pingUsed,
         done,
         username,
         coordinates,
@@ -2236,8 +2238,20 @@ async function reconcileReservationState(rowStates) {
       const reminderEnabled = !!rowState.reminder && reservationStr !== "—" && !completed;
       const currentIds = parseCurrentCustomIds(requestMsg);
       const hasPingButtonNow = currentIds.some((id) => id.startsWith("ping_"));
+      const renderedCompleted = getCompletedFromEmbed(requestMsg);
+      const hasSheetPingUsed = typeof rowState.pingUsed === "boolean";
+      const sheetPingUsed = !!rowState.pingUsed;
       if (!completed) {
-        setPingHiddenState(serial, false);
+        // Only reset ping-hidden when the message is also currently not completed.
+        // This avoids stale snapshots clearing ping-hidden state.
+        if (!renderedCompleted) setPingHiddenState(serial, false);
+      } else if (hasSheetPingUsed) {
+        if (sheetPingUsed) {
+          setPingHiddenState(serial, true);
+        } else if (!isPingHidden(serial) || hasPingButtonNow) {
+          // Avoid stale snapshots re-enabling ping right after it was consumed.
+          setPingHiddenState(serial, false);
+        }
       } else if (!hasPingButtonNow) {
         setPingHiddenState(serial, true);
       } else if (!pingHiddenByRow.has(String(serial))) {
@@ -3249,6 +3263,9 @@ async function toggleDoneAndClearRemind(rowSerial) {
   try {
     await postToAppsScript({ action: "clear_remind", rowSerial });
   } catch {}
+  try {
+    await postToAppsScript({ action: "clear_ping_used", rowSerial });
+  } catch {}
 
   return postToAppsScript({ action: "toggle_done", rowSerial });
 }
@@ -4104,6 +4121,9 @@ client.on("interactionCreate", async (interaction) => {
 
       const completed = getCompletedFromEmbed(interaction.message);
       if (rowSerial) setPingHiddenState(rowSerial, true);
+      if (rowSerial) {
+        postToAppsScript({ action: "set_ping_used", rowSerial }).catch(() => {});
+      }
 
       // Remove Ping button immediately to prevent spam
       try {
@@ -4406,7 +4426,3 @@ client.on("error", (err) => console.error("Discord client error:", err));
 process.on("unhandledRejection", (reason) => console.error("Unhandled promise rejection:", reason));
 
 client.login(DISCORD_TOKEN);
-
-
-
-
