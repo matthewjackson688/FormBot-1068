@@ -538,9 +538,11 @@ function setReservationRequestMessage(serial, channelId, messageId, originGuildI
     ...prev,
     requestChannelId: String(channelId),
     requestMessageId: String(messageId),
+    requestCreatedAt: Number(prev.requestCreatedAt) || Date.now(),
   };
   if (originGuildId) next.originGuildId = String(originGuildId);
   reservationMessages.set(key, next);
+  orphanDeletionCandidates.delete(key);
   persistReservationMessages();
 }
 
@@ -556,7 +558,9 @@ function setReservationReminderMessage(serial, channelId, messageId) {
 }
 
 function clearReservationMessage(serial) {
-  reservationMessages.delete(String(serial));
+  const key = String(serial);
+  reservationMessages.delete(key);
+  orphanDeletionCandidates.delete(key);
   persistReservationMessages();
 }
 
@@ -1121,6 +1125,8 @@ const SNAPSHOT_REFRESH_VERY_SLOW_MS = 20_000;
 const SNAPSHOT_REFRESH_SLOW_DELAY_MS = 30_000;
 const SNAPSHOT_REFRESH_MAX_DELAY_MS = 60_000;
 const DONE_STATE_OVERRIDE_TTL_MS = 15 * 60_000;
+const ORPHAN_DELETE_GRACE_MS = 120_000;
+const ORPHAN_DELETE_MIN_MISSES = 3;
 let timersNextFetchAttemptAt = 0;
 let timersFailureStreak = 0;
 let timersSnapshotRefreshPromise = null;
@@ -1130,6 +1136,7 @@ let lastSnapshotRefreshDurationMs = 0;
 let lastSnapshotReconcileAt = 0;
 let snapshotReconcileInFlight = false;
 let pendingSnapshotReconcile = null;
+const orphanDeletionCandidates = new Map(); // rowSerial -> { count, firstSeenAt }
 const timersStore = readJsonSafe(TIMERS_STORE_PATH, {});
 const reservationsStore = readJsonSafe(RESERVATIONS_STORE_PATH, {});
 
@@ -2132,13 +2139,37 @@ async function reconcileDeletedReservations(activeSerials) {
 
   orphanReservationCleanupInFlight = true;
   try {
+    const now = Date.now();
     const activeSet = new Set(activeSerials.map((s) => String(s)).filter(Boolean));
+    for (const serial of activeSet) {
+      orphanDeletionCandidates.delete(serial);
+    }
+
     const missing = Array.from(reservationMessages.keys()).filter((serial) => !activeSet.has(serial));
     if (missing.length === 0) return;
 
     let ownersChanged = false;
+    let messagesChanged = false;
+    let deletedAny = false;
     for (const serial of missing) {
       const ref = reservationMessages.get(serial) || {};
+      const createdAtMs = Number(ref.requestCreatedAt || 0);
+      const ageMs = createdAtMs > 0 ? (now - createdAtMs) : Number.POSITIVE_INFINITY;
+      const candidate = orphanDeletionCandidates.get(serial) || { count: 0, firstSeenAt: now };
+      candidate.count += 1;
+      orphanDeletionCandidates.set(serial, candidate);
+
+      const seenLongEnough = (now - candidate.firstSeenAt) >= ORPHAN_DELETE_GRACE_MS;
+      const oldEnoughRequest = ageMs >= ORPHAN_DELETE_GRACE_MS;
+      const shouldDelete =
+        candidate.count >= ORPHAN_DELETE_MIN_MISSES &&
+        seenLongEnough &&
+        oldEnoughRequest;
+
+      if (!shouldDelete) {
+        continue;
+      }
+
       cancelReminder(serial);
       if (reservationOwners.delete(serial)) ownersChanged = true;
 
@@ -2146,11 +2177,15 @@ async function reconcileDeletedReservations(activeSerials) {
       await deleteMessageRef(runtimeClient, ref.reminderChannelId, ref.reminderMessageId);
 
       reservationMessages.delete(serial);
+      orphanDeletionCandidates.delete(serial);
+      messagesChanged = true;
+      deletedAny = true;
       auditLog("manual_row_delete_sync", { rowSerial: serial });
     }
 
+    if (!deletedAny) return;
     if (ownersChanged) persistReservationOwners();
-    persistReservationMessages();
+    if (messagesChanged) persistReservationMessages();
     updateAllTimersMessages(runtimeClient);
     updateAllReservationsMessages(runtimeClient);
   } finally {
@@ -4426,3 +4461,4 @@ client.on("error", (err) => console.error("Discord client error:", err));
 process.on("unhandledRejection", (reason) => console.error("Unhandled promise rejection:", reason));
 
 client.login(DISCORD_TOKEN);
+
