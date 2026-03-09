@@ -1257,6 +1257,10 @@ function parseQuotedSearchTerm(input) {
   };
 }
 
+function escapeRegex(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function parseDmChannelRequest(content) {
   const guildOnlyMatch = String(content || "").trim().match(/^(\d{17,20})$/);
   if (guildOnlyMatch) {
@@ -1349,6 +1353,7 @@ async function fetchChannelMessages(channel, filter, session = null) {
     allMessages.length = filter.count;
   }
   const searchTerm = String(filter?.searchTerm || "").trim().toLowerCase();
+  const searchRegex = searchTerm ? new RegExp(`\\b${escapeRegex(searchTerm)}\\b`, "i") : null;
   const filtered = searchTerm
     ? allMessages.filter((message) => {
         const haystacks = [
@@ -1359,7 +1364,7 @@ async function fetchChannelMessages(channel, filter, session = null) {
           ]),
           ...Array.from(message.attachments?.values?.() || []).map((attachment) => String(attachment.name || "")),
         ];
-        return haystacks.some((value) => value.toLowerCase().includes(searchTerm));
+        return haystacks.some((value) => searchRegex.test(value));
       })
     : allMessages;
   filtered.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
