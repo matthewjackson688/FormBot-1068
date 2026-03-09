@@ -1,0 +1,16 @@
+#open repo#
+cd /home/matthew/Documents
+git clone git@github.com:matthewjackson688/FormBot-1068.git
+cd FormBot-1068
+code .
+
+#VM update#
+cd /home/ubuntu/FormBot
+git pull origin main
+pm2 restart FormBot-1068 --update-env
+
+#Update here#
+cd /home/matthew/Documents/FormBot-1068
+git add .
+git commit -m "Update bot code"
+git push origin main
