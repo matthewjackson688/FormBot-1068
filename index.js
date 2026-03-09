@@ -1234,28 +1234,144 @@ function formatGuildChannelList(guild) {
   return chunks;
 }
 
-async function fetchAllChannelMessages(channel) {
+function parseDmDateToken(value) {
+  const raw = String(value || "").trim();
+  const match = raw.match(/^(\d{2})\/(\d{2})\/(\d{2}|\d{4})$/);
+  if (!match) return null;
+  const day = Number(match[1]);
+  const month = Number(match[2]);
+  const year = match[3].length === 2 ? 2000 + Number(match[3]) : Number(match[3]);
+  const dt = DateTime.fromObject({ year, month, day, zone: "utc" });
+  if (!dt.isValid) return null;
+  return dt;
+}
+
+function parseQuotedSearchTerm(input) {
+  const raw = String(input || "").trim();
+  if (!raw) return { remainder: "", searchTerm: null };
+  const match = raw.match(/^(.*?)\s*"([^"]+)"\s*$/);
+  if (!match) return { remainder: raw, searchTerm: null };
+  return {
+    remainder: String(match[1] || "").trim(),
+    searchTerm: String(match[2] || "").trim() || null,
+  };
+}
+
+function parseDmChannelRequest(content) {
+  const guildOnlyMatch = String(content || "").trim().match(/^(\d{17,20})$/);
+  if (guildOnlyMatch) {
+    return { type: "guild_only", guildId: guildOnlyMatch[1] };
+  }
+
+  const guildChannelMatch = String(content || "").trim().match(/^(\d{17,20})\s*:\s*(\d{17,20})(?:\s+(.+))?$/);
+  if (!guildChannelMatch) return null;
+
+  const guildId = guildChannelMatch[1];
+  const channelId = guildChannelMatch[2];
+  const parsedSearch = parseQuotedSearchTerm(guildChannelMatch[3] || "");
+  const rawFilter = parsedSearch.remainder;
+  const searchTerm = parsedSearch.searchTerm;
+  if (!rawFilter) {
+    const label = searchTerm ? `all readable messages containing "${searchTerm}"` : "all readable messages";
+    return {
+      type: "channel_export",
+      guildId,
+      channelId,
+      filter: { type: "all", label, searchTerm },
+    };
+  }
+
+  if (/^\d+$/.test(rawFilter)) {
+    const count = Number(rawFilter);
+    if (!Number.isFinite(count) || count <= 0) return null;
+    const label = searchTerm
+      ? `most recent ${count} messages containing "${searchTerm}"`
+      : `most recent ${count} messages`;
+    return {
+      type: "channel_export",
+      guildId,
+      channelId,
+      filter: { type: "count", count, label, searchTerm },
+    };
+  }
+
+  const rangeMatch = rawFilter.match(/^(\d{2}\/\d{2}\/(?:\d{2}|\d{4}))\s*-\s*(\d{2}\/\d{2}\/(?:\d{2}|\d{4}))$/);
+  if (!rangeMatch) return null;
+  const start = parseDmDateToken(rangeMatch[1]);
+  const end = parseDmDateToken(rangeMatch[2]);
+  if (!start || !end) return null;
+  const startMs = start.startOf("day").toMillis();
+  const endMs = end.endOf("day").toMillis();
+  if (endMs < startMs) return null;
+  const rangeLabel = `${start.toFormat("dd/MM/yy")}-${end.toFormat("dd/MM/yy")} GMT`;
+  return {
+    type: "channel_export",
+    guildId,
+    channelId,
+    filter: {
+      type: "date_range",
+      startMs,
+      endMs,
+      label: searchTerm ? `${rangeLabel} containing "${searchTerm}"` : rangeLabel,
+      searchTerm,
+    },
+  };
+}
+
+async function fetchChannelMessages(channel, filter, session = null) {
   const allMessages = [];
   let before;
 
   while (true) {
+    if (session?.cancelled) break;
     const batch = await channel.messages.fetch({ limit: 100, before });
     if (!batch.size) break;
     const items = Array.from(batch.values());
-    allMessages.push(...items);
+    if (filter?.type === "count") {
+      allMessages.push(...items);
+      if (allMessages.length >= filter.count) break;
+    } else if (filter?.type === "date_range") {
+      for (const item of items) {
+        if (item.createdTimestamp >= filter.startMs && item.createdTimestamp <= filter.endMs) {
+          allMessages.push(item);
+        }
+      }
+      const oldestTimestamp = items[items.length - 1]?.createdTimestamp ?? 0;
+      if (oldestTimestamp < filter.startMs) break;
+    } else {
+      allMessages.push(...items);
+    }
     before = items[items.length - 1]?.id;
     if (batch.size < 100) break;
   }
 
-  allMessages.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
-  return allMessages;
+  if (filter?.type === "count" && allMessages.length > filter.count) {
+    allMessages.length = filter.count;
+  }
+  const searchTerm = String(filter?.searchTerm || "").trim().toLowerCase();
+  const filtered = searchTerm
+    ? allMessages.filter((message) => {
+        const haystacks = [
+          String(message.content || ""),
+          ...Array.from(message.embeds || []).flatMap((embed) => [
+            String(embed.title || ""),
+            String(embed.description || ""),
+          ]),
+          ...Array.from(message.attachments?.values?.() || []).map((attachment) => String(attachment.name || "")),
+        ];
+        return haystacks.some((value) => value.toLowerCase().includes(searchTerm));
+      })
+    : allMessages;
+  filtered.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+  return filtered;
 }
 
-function buildChannelTranscript(guild, channel, messages) {
+function buildChannelTranscript(guild, channel, messages, filterLabel = "all readable messages") {
   const lines = [
     `Guild: ${guild.name} (${guild.id})`,
     `Channel: ${channel.name || "(no name)"} (${channel.id})`,
-    `Exported At: ${new Date().toISOString()}`,
+    `Selection: ${filterLabel}`,
+    `Exported At: ${DateTime.now().setZone("utc").toFormat("HH:mm dd/MM/yyyy 'GMT'")}`,
     `Message Count: ${messages.length}`,
     "",
   ];
@@ -3627,14 +3743,18 @@ client.on("messageCreate", async (message) => {
     }
 
     if (!content) {
-      await message.reply("Send `guild_id` to list channels, `guild_id:channel_id` to stream that channel's messages, or `stop` to cancel an active export.");
+      await message.reply("Send `guild_id`, `guild_id:channel_id`, `guild_id:channel_id 1000`, `guild_id:channel_id 03/03/26-09/03/26`, `guild_id:channel_id \"cat\"`, `guild_id:channel_id 1000 \"cat\"`, or `stop`.");
       return;
     }
 
-    const guildChannelMatch = content.match(/^\s*(\d{17,20})\s*:\s*(\d{17,20})\s*$/);
-    if (guildChannelMatch) {
-      const guildId = guildChannelMatch[1];
-      const channelId = guildChannelMatch[2];
+    const request = parseDmChannelRequest(content);
+    if (!request) {
+      await message.reply("Send `guild_id`, `guild_id:channel_id`, `guild_id:channel_id 1000`, `guild_id:channel_id 03/03/26-09/03/26`, `guild_id:channel_id \"cat\"`, `guild_id:channel_id 1000 \"cat\"`, or `stop`.");
+      return;
+    }
+
+    if (request.type === "channel_export") {
+      const { guildId, channelId, filter } = request;
       let guild;
       try {
         guild = await client.guilds.fetch(guildId);
@@ -3667,9 +3787,14 @@ client.on("messageCreate", async (message) => {
       }
 
       const session = startDmExportSession(message.author.id, `${guildId}:${channelId}`);
-      await message.reply(`Streaming messages from #${channel.name || channel.id} in ${guild.name}. Send \`stop\` to cancel.`);
-      const messages = await fetchAllChannelMessages(channel);
-      const transcript = buildChannelTranscript(guild, channel, messages);
+      await message.reply(`Streaming ${filter.label} from #${channel.name || channel.id} in ${guild.name}. Send \`stop\` to cancel.`);
+      const messages = await fetchChannelMessages(channel, filter, session);
+      if (session.cancelled) {
+        finishDmExportSession(message.author.id, session);
+        await message.author.send("Export stopped.");
+        return;
+      }
+      const transcript = buildChannelTranscript(guild, channel, messages, filter.label);
       const chunks = chunkText(transcript);
       for (let i = 0; i < chunks.length; i += 1) {
         if (session.cancelled) {
@@ -3687,13 +3812,7 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    const guildIdMatch = content.match(/^\s*(\d{17,20})\s*$/);
-    if (!guildIdMatch) {
-      await message.reply("Send a valid `guild_id`, `guild_id:channel_id`, or `stop`.");
-      return;
-    }
-
-    const guildId = guildIdMatch[0];
+    const guildId = request.guildId;
     let guild;
     try {
       guild = await client.guilds.fetch(guildId);
