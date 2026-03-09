@@ -1119,6 +1119,7 @@ const interactionCooldowns = new Map(); // key -> expiresAtMs
 const doneToggleInFlight = new Set(); // rowSerial keys currently toggling done/not done
 const doneStateOverrides = new Map(); // rowSerial -> { done, expiresAt }
 const pingHiddenByRow = new Map(); // rowSerial -> true when ping was already used for current done cycle
+const activeDmExports = new Map(); // userId -> { key, cancelled }
 const LIVE_MESSAGE_REFRESH_MS = 15_000;
 let startupStickyDelayUntil = 0;
 let lastTimersText = null;
@@ -1231,6 +1232,109 @@ function formatGuildChannelList(guild) {
   }
   if (current) chunks.push(current);
   return chunks;
+}
+
+async function fetchAllChannelMessages(channel) {
+  const allMessages = [];
+  let before;
+
+  while (true) {
+    const batch = await channel.messages.fetch({ limit: 100, before });
+    if (!batch.size) break;
+    const items = Array.from(batch.values());
+    allMessages.push(...items);
+    before = items[items.length - 1]?.id;
+    if (batch.size < 100) break;
+  }
+
+  allMessages.sort((a, b) => a.createdTimestamp - b.createdTimestamp);
+  return allMessages;
+}
+
+function buildChannelTranscript(guild, channel, messages) {
+  const lines = [
+    `Guild: ${guild.name} (${guild.id})`,
+    `Channel: ${channel.name || "(no name)"} (${channel.id})`,
+    `Exported At: ${new Date().toISOString()}`,
+    `Message Count: ${messages.length}`,
+    "",
+  ];
+
+  for (const message of messages) {
+    const createdAt = message.createdAt ? message.createdAt.toISOString() : "unknown_time";
+    const author = message.author?.tag || message.author?.username || "Unknown User";
+    lines.push(`[${createdAt}] ${author} (${message.author?.id || "unknown_id"})`);
+
+    const content = String(message.content || "").trim();
+    if (content) {
+      lines.push(content);
+    }
+
+    if (message.attachments?.size) {
+      for (const attachment of message.attachments.values()) {
+        lines.push(`[Attachment] ${attachment.name || "file"}: ${attachment.url}`);
+      }
+    }
+
+    if (message.embeds?.length) {
+      for (const embed of message.embeds) {
+        const embedParts = [];
+        if (embed.title) embedParts.push(`title=${embed.title}`);
+        if (embed.description) embedParts.push(`description=${embed.description}`);
+        if (embed.url) embedParts.push(`url=${embed.url}`);
+        if (embedParts.length) {
+          lines.push(`[Embed] ${embedParts.join(" | ")}`);
+        } else {
+          lines.push("[Embed]");
+        }
+      }
+    }
+
+    if (!content && !message.attachments?.size && !message.embeds?.length) {
+      lines.push("[No text content]");
+    }
+
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
+function chunkText(text, maxLen = 1800) {
+  const chunks = [];
+  let remaining = String(text || "");
+  while (remaining.length > maxLen) {
+    let splitAt = remaining.lastIndexOf("\n", maxLen);
+    if (splitAt <= 0) splitAt = maxLen;
+    chunks.push(remaining.slice(0, splitAt));
+    remaining = remaining.slice(splitAt).replace(/^\n+/, "");
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
+
+function getActiveDmExport(userId) {
+  return activeDmExports.get(String(userId || "").trim()) || null;
+}
+
+function startDmExportSession(userId, key) {
+  const session = { key, cancelled: false };
+  activeDmExports.set(String(userId || "").trim(), session);
+  return session;
+}
+
+function cancelDmExportSession(userId) {
+  const session = getActiveDmExport(userId);
+  if (!session) return false;
+  session.cancelled = true;
+  return true;
+}
+
+function finishDmExportSession(userId, session) {
+  const current = getActiveDmExport(userId);
+  if (current === session) {
+    activeDmExports.delete(String(userId || "").trim());
+  }
 }
 
 function setTimersBackoff(isRateLimited = false) {
@@ -3514,14 +3618,76 @@ client.on("messageCreate", async (message) => {
     if (!isAllowedDmUser(message.author.id)) return;
 
     const content = String(message.content || "").trim();
-    if (!content) {
-      await message.reply("Send a server ID and I will list that server's channels.");
+    if (/^stop$/i.test(content)) {
+      const cancelled = cancelDmExportSession(message.author.id);
+      await message.reply(cancelled ? "Stopping the active channel export." : "There is no active channel export to stop.");
       return;
     }
 
-    const guildIdMatch = content.match(/\b\d{17,20}\b/);
+    if (!content) {
+      await message.reply("Send `guild_id` to list channels, `guild_id:channel_id` to stream that channel's messages, or `stop` to cancel an active export.");
+      return;
+    }
+
+    const guildChannelMatch = content.match(/^\s*(\d{17,20})\s*:\s*(\d{17,20})\s*$/);
+    if (guildChannelMatch) {
+      const guildId = guildChannelMatch[1];
+      const channelId = guildChannelMatch[2];
+      let guild;
+      try {
+        guild = await client.guilds.fetch(guildId);
+      } catch {
+        await message.reply("I can't access that server. Make sure I'm in it and the ID is correct.");
+        return;
+      }
+
+      let channel;
+      try {
+        channel = await client.channels.fetch(channelId);
+      } catch {
+        await message.reply("I can't access that channel. Check the channel ID and my permissions.");
+        return;
+      }
+
+      if (!channel?.isTextBased?.() || !("messages" in channel)) {
+        await message.reply("That channel is not a text channel I can read.");
+        return;
+      }
+      if (channel.guildId !== guildId) {
+        await message.reply("That channel does not belong to the guild ID you sent.");
+        return;
+      }
+
+      const existingSession = getActiveDmExport(message.author.id);
+      if (existingSession && !existingSession.cancelled) {
+        await message.reply("A channel export is already running. Send `stop` first if you want to cancel it.");
+        return;
+      }
+
+      const session = startDmExportSession(message.author.id, `${guildId}:${channelId}`);
+      await message.reply(`Streaming messages from #${channel.name || channel.id} in ${guild.name}. Send \`stop\` to cancel.`);
+      const messages = await fetchAllChannelMessages(channel);
+      const transcript = buildChannelTranscript(guild, channel, messages);
+      const chunks = chunkText(transcript);
+      for (let i = 0; i < chunks.length; i += 1) {
+        if (session.cancelled) {
+          await message.author.send(`Export stopped after ${i} chunk${i === 1 ? "" : "s"}.`);
+          finishDmExportSession(message.author.id, session);
+          return;
+        }
+        await message.author.send(chunks[i]);
+        if (i < chunks.length - 1) {
+          await sleep(200);
+        }
+      }
+      finishDmExportSession(message.author.id, session);
+      await message.author.send(`Export complete. Sent ${chunks.length} chunk${chunks.length === 1 ? "" : "s"}.`);
+      return;
+    }
+
+    const guildIdMatch = content.match(/^\s*(\d{17,20})\s*$/);
     if (!guildIdMatch) {
-      await message.reply("Send a valid Discord server ID.");
+      await message.reply("Send a valid `guild_id`, `guild_id:channel_id`, or `stop`.");
       return;
     }
 
