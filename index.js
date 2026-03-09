@@ -1261,9 +1261,11 @@ function buildChannelTranscript(guild, channel, messages) {
   ];
 
   for (const message of messages) {
-    const createdAt = message.createdAt ? message.createdAt.toISOString() : "unknown_time";
+    const createdAt = message.createdAt
+      ? DateTime.fromJSDate(message.createdAt, { zone: "utc" }).toFormat("HH:mm dd/MM/yyyy 'GMT'")
+      : "unknown_time";
     const author = message.author?.tag || message.author?.username || "Unknown User";
-    lines.push(`[${createdAt}] ${author} (${message.author?.id || "unknown_id"})`);
+    lines.push(`[${createdAt}] **${author}**`);
 
     const content = String(message.content || "").trim();
     if (content) {
