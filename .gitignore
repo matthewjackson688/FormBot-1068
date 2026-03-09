@@ -16,3 +16,7 @@ timers-messages.json
 reservations-messages.json
 reservation-messages.json
 reservation-owners.json
+
+tokens.txt
+.env
+.env.*
