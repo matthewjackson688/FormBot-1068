@@ -33,6 +33,7 @@ const fs = require("fs");
 const {
   Client,
   GatewayIntentBits,
+  Partials,
   SlashCommandBuilder,
   REST,
   Routes,
@@ -143,6 +144,7 @@ const TIMERS_STORE_PATH = path.join(__dirname, "timers-messages.json");
 const RESERVATIONS_STORE_PATH = path.join(__dirname, "reservations-messages.json");
 const RESERVATION_OWNER_STORE_PATH = path.join(__dirname, "reservation-owners.json");
 const RESERVATION_MESSAGE_STORE_PATH = path.join(__dirname, "reservation-messages.json");
+const DM_ALLOWLIST_STORE_PATH = path.join(__dirname, "dm-allowed-users.json");
 const AUDIT_LOG_PATH = path.join(__dirname, "audit.log");
 const REQUEST_LOG_PATH = path.join(__dirname, "request.log");
 const BUTTON_LOG_PATH = path.join(__dirname, "button-logs.ndjson");
@@ -170,6 +172,22 @@ function readJsonSafe(filepath, fallback = {}) {
     return fallback;
   }
 }
+
+function normalizeIdList(input) {
+  const values = Array.isArray(input)
+    ? input
+    : (input && typeof input === "object" && Array.isArray(input.allowedUserIds))
+      ? input.allowedUserIds
+      : [];
+  return Array.from(
+    new Set(
+      values
+        .map((value) => String(value || "").trim())
+        .filter((value) => /^\d+$/.test(value))
+    )
+  );
+}
+
 const bufferedJsonWrites = new Map(); // filepath -> { data, timer, inFlight, dirty }
 const bufferedLogWrites = new Map(); // filepath -> { chunks, timer, inFlight }
 const processedButtonInteractionIds = new Map(); // interactionId -> expiresAtMs
@@ -1136,6 +1154,8 @@ let pendingSnapshotReconcile = null;
 const orphanDeletionCandidates = new Map(); // rowSerial -> { count, firstSeenAt }
 const timersStore = readJsonSafe(TIMERS_STORE_PATH, {});
 const reservationsStore = readJsonSafe(RESERVATIONS_STORE_PATH, {});
+const dmAllowlistStore = readJsonSafe(DM_ALLOWLIST_STORE_PATH, { allowedUserIds: [] });
+const allowedDmUserIds = new Set(normalizeIdList(dmAllowlistStore));
 
 for (const [channelId, messageId] of Object.entries(timersStore)) {
   if (channelId && messageId) {
@@ -1160,6 +1180,57 @@ function persistReservationsStore() {
     Array.from(reservationsMessageByChannel.entries()).map(([channelId, entry]) => [channelId, entry?.messageId])
   );
   writeJsonSafe(RESERVATIONS_STORE_PATH, data);
+}
+
+function isAllowedDmUser(userId) {
+  return allowedDmUserIds.has(String(userId || "").trim());
+}
+
+function formatGuildChannelList(guild) {
+  const channels = Array.from(guild.channels.cache.values())
+    .sort((a, b) => {
+      const positionA = Number(a?.rawPosition ?? 0);
+      const positionB = Number(b?.rawPosition ?? 0);
+      if (positionA !== positionB) return positionA - positionB;
+      return String(a?.name || "").localeCompare(String(b?.name || ""));
+    });
+
+  if (channels.length === 0) {
+    return [`Channels in ${guild.name} (${guild.id})\nNo channels found.`];
+  }
+
+  const typeLabels = {
+    0: "text",
+    2: "voice",
+    4: "category",
+    5: "announcement",
+    11: "thread",
+    12: "private_thread",
+    13: "stage",
+    14: "directory",
+    15: "forum",
+    16: "media",
+  };
+
+  const lines = channels.map((channel) => {
+    const typeLabel = typeLabels[channel.type] || `type_${channel.type}`;
+    return `- ${channel.name || "(no name)"} [${typeLabel}] (${channel.id})`;
+  });
+
+  const header = `Channels in ${guild.name} (${guild.id})`;
+  const chunks = [];
+  let current = header;
+  for (const line of lines) {
+    const candidate = `${current}\n${line}`;
+    if (candidate.length > 1900) {
+      chunks.push(current);
+      current = `${header}\n${line}`;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
 }
 
 function setTimersBackoff(isRateLimited = false) {
@@ -3361,12 +3432,20 @@ const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 // =====================
 // CLIENT
 // =====================
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+  partials: [Partials.Channel],
+});
 
 client.once("clientReady", async () => {
   runtimeClient = client;
   startupStickyDelayUntil = Date.now() + 2 * 60_000;
   console.log(`🤖 Logged in as ${client.user.tag}`);
+  console.log(`🔐 DM allowlist entries: ${allowedDmUserIds.size}`);
   scheduleHourlyRestart();
   await runStartupChecks(client);
   try {
@@ -3425,6 +3504,53 @@ client.once("clientReady", async () => {
   }
   if (reservationsMessageByChannel.size > 0) {
     persistReservationsStore();
+  }
+});
+
+client.on("messageCreate", async (message) => {
+  try {
+    if (!message || message.author?.bot) return;
+    if (message.guildId) return;
+    if (!isAllowedDmUser(message.author.id)) return;
+
+    const content = String(message.content || "").trim();
+    if (!content) {
+      await message.reply("Send a server ID and I will list that server's channels.");
+      return;
+    }
+
+    const guildIdMatch = content.match(/\b\d{17,20}\b/);
+    if (!guildIdMatch) {
+      await message.reply("Send a valid Discord server ID.");
+      return;
+    }
+
+    const guildId = guildIdMatch[0];
+    let guild;
+    try {
+      guild = await client.guilds.fetch(guildId);
+    } catch {
+      await message.reply("I can't access that server. Make sure I'm in it and the ID is correct.");
+      return;
+    }
+
+    try {
+      await guild.channels.fetch();
+    } catch {}
+
+    const chunks = formatGuildChannelList(guild);
+    for (let i = 0; i < chunks.length; i += 1) {
+      if (i === 0) {
+        await message.reply(chunks[i]);
+      } else {
+        await message.author.send(chunks[i]);
+      }
+    }
+  } catch (err) {
+    console.error("DM channel lookup error:", err);
+    try {
+      await message.reply("❌ Something went wrong while listing channels.");
+    } catch {}
   }
 });
 
