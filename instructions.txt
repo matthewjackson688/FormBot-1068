@@ -1,3 +1,5 @@
+ssh -i "/home/matthew/Documents/Bots/FormBot_1068/1068.key" ubuntu@132.145.49.38
+
 #open repo#
 cd /home/matthew/Documents
 git clone git@github.com:matthewjackson688/FormBot-1068.git
