@@ -4478,9 +4478,7 @@ client.on("interactionCreate", async (interaction) => {
       if (!isConfirm) {
         auditLog("remove_click", {
           userId: interaction.user.id,
-          rowSerial,
-          guildId: interaction.guildId,
-          channelId: interaction.channelId,
+          username: interaction.user?.tag || interaction.user?.username || "Unknown",
         });
         try {
           await interaction.deferUpdate();
@@ -4521,6 +4519,10 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
+      auditLog("remove_confirm_click", {
+        userId: interaction.user.id,
+        username: interaction.user?.tag || interaction.user?.username || "Unknown",
+      });
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       let js;
