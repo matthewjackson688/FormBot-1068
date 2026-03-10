@@ -1123,6 +1123,8 @@ const activeDmExports = new Map(); // userId -> { key, cancelled }
 const LIVE_MESSAGE_REFRESH_MS = 15_000;
 const RESERVATIONS_CACHE_MAX_AGE_MS = 10 * 60_000;
 const RESERVATIONS_FORCE_REPOST_MS = 60 * 60_000;
+const TIMERS_SNAPSHOT_HARD_RESET_MS = 60 * 60_000;
+const TIMERS_SNAPSHOT_REFRESH_HANG_MS = 60_000;
 let startupStickyDelayUntil = 0;
 let lastTimersText = null;
 let lastTimersTextAt = 0;
@@ -1148,12 +1150,14 @@ const ORPHAN_DELETE_MIN_MISSES = 3;
 let timersNextFetchAttemptAt = 0;
 let timersFailureStreak = 0;
 let timersSnapshotRefreshPromise = null;
+let timersSnapshotRefreshStartedAt = 0;
 let timersSnapshotBackgroundIntervalId = null;
 let timersSnapshotBackgroundInFlight = false;
 let lastSnapshotRefreshDurationMs = 0;
 let lastSnapshotReconcileAt = 0;
 let snapshotReconcileInFlight = false;
 let pendingSnapshotReconcile = null;
+let timersSnapshotResetCounter = 0;
 const orphanDeletionCandidates = new Map(); // rowSerial -> { count, firstSeenAt }
 const timersStore = readJsonSafe(TIMERS_STORE_PATH, {});
 const reservationsStore = readJsonSafe(RESERVATIONS_STORE_PATH, {});
@@ -1514,6 +1518,38 @@ function scheduleSnapshotReconcile(activeSerials, rowStates) {
     rowStates: Array.isArray(rowStates) ? rowStates : [],
   };
   tryStartSnapshotReconcile();
+}
+
+function resetTimersSnapshot(reason) {
+  if (!timersSnapshot && !lastTimersText && !timersSnapshotRefreshPromise) return;
+  timersSnapshot = null;
+  timersSnapshotAt = 0;
+  lastTimersText = null;
+  lastTimersTextAt = 0;
+  timersSnapshotRefreshPromise = null;
+  timersSnapshotRefreshStartedAt = 0;
+  timersFailureStreak = 0;
+  timersNextFetchAttemptAt = 0;
+  timersLastFailureAt = 0;
+  timersSnapshotResetCounter += 1;
+  console.warn(`⚠️ Timers snapshot reset (${reason}).`);
+}
+
+function getTimersSnapshotStaleReason(now) {
+  if (timersSnapshot && timersSnapshotAt && now - timersSnapshotAt >= TIMERS_SNAPSHOT_HARD_RESET_MS) {
+    return "age";
+  }
+  if (
+    timersSnapshotRefreshPromise &&
+    timersSnapshotRefreshStartedAt &&
+    now - timersSnapshotRefreshStartedAt >= TIMERS_SNAPSHOT_REFRESH_HANG_MS
+  ) {
+    return "refresh_hang";
+  }
+  if (timersSnapshot && timersSnapshotAt && timersSnapshotAt > now + 5 * 60_000) {
+    return "clock_skew";
+  }
+  return null;
 }
 
 async function getTextBasedChannel(client, channelId) {
@@ -2168,6 +2204,10 @@ function renderTimersTextFromSnapshot() {
 async function fetchTimersText(opts = {}) {
   const cacheOnly = !!opts.cacheOnly;
   const now = Date.now();
+  const staleReason = getTimersSnapshotStaleReason(now);
+  if (staleReason) {
+    resetTimersSnapshot(staleReason);
+  }
   if (cacheOnly) {
     const rendered = renderTimersTextFromSnapshot();
     if (rendered) return rendered;
@@ -2181,9 +2221,11 @@ async function fetchTimersText(opts = {}) {
   if (!timersSnapshot || now - timersSnapshotAt >= TIMERS_REFRESH_MS) {
     if (!timersSnapshotRefreshPromise) {
       timersSnapshotRefreshPromise = (async () => {
+        const refreshGeneration = timersSnapshotResetCounter;
         let json;
         let source = SHEETDB_URL ? "sheetdb" : "apps_script";
         const fetchStartedAt = Date.now();
+        timersSnapshotRefreshStartedAt = fetchStartedAt;
         try {
           if (SHEETDB_URL) {
             json = await fetchTimersSnapshotFromSheetDb();
@@ -2222,6 +2264,9 @@ async function fetchTimersText(opts = {}) {
         }
 
         const postProcessStartedAt = Date.now();
+        if (refreshGeneration !== timersSnapshotResetCounter) {
+          return false;
+        }
         timersFailureStreak = 0;
         timersNextFetchAttemptAt = 0;
         timersSnapshot = json;
@@ -2234,6 +2279,7 @@ async function fetchTimersText(opts = {}) {
         return true;
       })().finally(() => {
         timersSnapshotRefreshPromise = null;
+        timersSnapshotRefreshStartedAt = 0;
       });
     }
 
