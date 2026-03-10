@@ -4476,6 +4476,12 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       if (!isConfirm) {
+        auditLog("remove_click", {
+          userId: interaction.user.id,
+          rowSerial,
+          guildId: interaction.guildId,
+          channelId: interaction.channelId,
+        });
         try {
           await interaction.deferUpdate();
         } catch (e) {
