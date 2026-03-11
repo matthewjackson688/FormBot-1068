@@ -1247,7 +1247,7 @@ function parseDmDateToken(value) {
   const day = Number(match[1]);
   const month = Number(match[2]);
   const year = match[3].length === 2 ? 2000 + Number(match[3]) : Number(match[3]);
-  const dt = DateTime.fromObject({ year, month, day, zone: "utc" });
+  const dt = DateTime.fromObject({ year, month, day }, { zone: "utc" });
   if (!dt.isValid) return null;
   return dt;
 }
