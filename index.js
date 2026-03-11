@@ -1305,15 +1305,19 @@ function parseDmChannelRequest(content) {
     };
   }
 
-  const rangeMatch = rawFilter.match(/^(\d{2}\/\d{2}\/(?:\d{2}|\d{4}))\s*-\s*(\d{2}\/\d{2}\/(?:\d{2}|\d{4}))$/);
+  const rangeMatch = rawFilter.match(
+    /^(\d{2}\/\d{2}\/(?:\d{2}|\d{4}))\s*-\s*(\d{2}\/\d{2}\/(?:\d{2}|\d{4})|now|today)$/i
+  );
   if (!rangeMatch) return null;
   const start = parseDmDateToken(rangeMatch[1]);
-  const end = parseDmDateToken(rangeMatch[2]);
+  const endToken = String(rangeMatch[2] || "").trim().toLowerCase();
+  const end = endToken === "now" || endToken === "today" ? DateTime.utc() : parseDmDateToken(rangeMatch[2]);
   if (!start || !end) return null;
   const startMs = start.startOf("day").toMillis();
-  const endMs = end.endOf("day").toMillis();
+  const endMs = endToken === "now" ? end.toMillis() : end.endOf("day").toMillis();
   if (endMs < startMs) return null;
-  const rangeLabel = `${start.toFormat("dd/MM/yy")}-${end.toFormat("dd/MM/yy")} GMT`;
+  const endLabel = endToken === "now" ? "now" : end.toFormat("dd/MM/yy");
+  const rangeLabel = `${start.toFormat("dd/MM/yy")}-${endLabel} GMT`;
   return {
     type: "channel_export",
     guildId,

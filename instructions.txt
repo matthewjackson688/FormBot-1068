@@ -16,3 +16,6 @@ cd /home/matthew/Documents/FormBot-1068
 git add .
 git commit -m "Update bot code"
 git push origin main
+
+##check remove log##
+rg "remove_click|remove_confirm_click" audit.log
