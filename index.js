@@ -1690,7 +1690,7 @@ async function findExistingReservationsMessage(channel, client) {
       (m) =>
         m?.author?.id === client?.user?.id &&
         typeof m.content === "string" &&
-        m.content.includes("Next reservation time (UTC)")
+        (m.content.includes("Next reservation time") || m.content.includes("Next reservation time (UTC)"))
     ) || null
   );
 }
@@ -2165,6 +2165,11 @@ function renderTimersTextFromSnapshot() {
     { secondsUntil: Number(t.secondsUntil) - ageSeconds, reservationUtc: String(t.reservationUtc || "") },
   ]));
   const titles = ["Governor", "Architect", "Prefect", "General"];
+  const formatTimestamp = (secondsUntil, style = "f") => {
+    if (!Number.isFinite(secondsUntil)) return null;
+    const unix = Math.floor((Date.now() + secondsUntil * 1000) / 1000);
+    return `<t:${unix}:${style}>`;
+  };
   const formatRemaining = (title) => {
     const possible = nextPossibleByTitle.get(title);
     if (possible && Number.isFinite(possible.secondsUntil)) {
@@ -2189,18 +2194,13 @@ function renderTimersTextFromSnapshot() {
     const hasActiveCooldown = Number.isFinite(cooldownSeconds) && cooldownSeconds > 0;
     if (!hasUpcomingReservation && !hasActiveCooldown) return "Any time/date";
     if (!next || !Number.isFinite(next.secondsUntil) || !next.reservationUtc) return "Unknown";
-    const res = next.reservationUtc;
-    const match = res.match(/^(\d{2}):(\d{2})\s+(\d{2})\/(\d{2})\/(\d{4})$/);
-    if (!match) return res;
-    const timePart = `${match[1]}:${match[2]}`;
-    const datePart = `${match[3]}/${match[4]}/${match[5]}`;
-    const todayUtc = new Date().toISOString().slice(0, 10).split("-").reverse().join("/");
-    return datePart === todayUtc ? timePart : `${timePart} ${datePart}`;
+    const stamp = formatTimestamp(next.secondsUntil, "t");
+    return stamp || "Unknown";
   };
 
   const lines = [
     "\u200b",
-    "Next reservation time possible (UTC)",
+    "Next reservation time possible",
     ...titles.map((t) => `-# ${t}: ${formatNextPossible(t, nextPossibleByTitle.get(t))}`),
     "",
     "Time left until title is available",
@@ -2312,6 +2312,11 @@ function renderReservationsTextFromSnapshot() {
     { secondsUntil: Number(t.secondsUntil) - ageSeconds, reservationUtc: String(t.reservationUtc || "") },
   ]));
   const titles = ["Governor", "Architect", "Prefect", "General"];
+  const formatTimestamp = (secondsUntil, style = "f") => {
+    if (!Number.isFinite(secondsUntil)) return null;
+    const unix = Math.floor((Date.now() + secondsUntil * 1000) / 1000);
+    return `<t:${unix}:${style}>`;
+  };
   const formatUntil = (next) => {
     if (!next || !Number.isFinite(next.secondsUntil)) return "No reservation";
     if (next.secondsUntil <= 0) return "No reservation";
@@ -2319,21 +2324,15 @@ function renderReservationsTextFromSnapshot() {
     const hh = Math.floor(mmTotal / 60);
     const mm = mmTotal % 60;
     const remainingStr = hh > 0 ? `${hh}h ${mm}m` : `${mm}m`;
-    const res = next.reservationUtc;
-    const match = res.match(/^(\d{2}):(\d{2})\s+(\d{2})\/(\d{2})\/(\d{4})$/);
-    if (!match) return `Next reservation in ${mm}m`;
-    const timePart = `${match[1]}:${match[2]}`;
-    const datePart = `${match[3]}/${match[4]}/${match[5]}`;
-    const todayUtc = new Date().toISOString().slice(0, 10).split("-").reverse().join("/");
-    if (datePart === todayUtc) {
-      return `Next reservation at ${timePart}, in ${remainingStr}`;
-    }
-    return `Next reservation at ${timePart} ${datePart}, in ${remainingStr}`;
+    const stamp = formatTimestamp(next.secondsUntil, "t");
+    if (!stamp) return `Next reservation in ${mm}m`;
+    const relative = formatTimestamp(next.secondsUntil, "R");
+    return `Next reservation at ${stamp}, in ${relative || remainingStr}`;
   };
 
   return [
     "\u200b",
-    "Next reservation time (UTC)",
+    "Next reservation time",
     ...titles.map((t) => `-# ${t}: ${formatUntil(nextByTitle.get(t))}`),
   ].join("\n");
 }
