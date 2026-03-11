@@ -1267,6 +1267,14 @@ function escapeRegex(value) {
   return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+function buildSearchRegex(searchTerm) {
+  const raw = String(searchTerm || "").trim();
+  if (!raw) return null;
+  const base = escapeRegex(raw.toLowerCase());
+  const suffix = base.endsWith("s") ? "(?:es)?" : "(?:s|es)?";
+  return new RegExp(`\\b${base}${suffix}(?:'s)?\\b`, "i");
+}
+
 function parseDmChannelRequest(content) {
   const guildOnlyMatch = String(content || "").trim().match(/^(\d{17,20})$/);
   if (guildOnlyMatch) {
@@ -1362,8 +1370,8 @@ async function fetchChannelMessages(channel, filter, session = null) {
   if (filter?.type === "count" && allMessages.length > filter.count) {
     allMessages.length = filter.count;
   }
-  const searchTerm = String(filter?.searchTerm || "").trim().toLowerCase();
-  const searchRegex = searchTerm ? new RegExp(`\\b${escapeRegex(searchTerm)}\\b`, "i") : null;
+  const searchTerm = String(filter?.searchTerm || "").trim();
+  const searchRegex = buildSearchRegex(searchTerm);
   const filtered = searchTerm
     ? allMessages.filter((message) => {
         const haystacks = [
