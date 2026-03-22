@@ -116,6 +116,7 @@ const TARGET_PING_CHANNEL_IDS = Array.from(
 const TARGET_COMMAND_CHANNEL_IDS = parseCsvIds(COMMAND_CHANNEL_IDS);
 const COMMAND_CHANNEL_SET = new Set(TARGET_COMMAND_CHANNEL_IDS);
 const BLOCKS_ENABLED = String(BLOCK_BOOLEAN ?? "1").trim() === "1";
+const VAULT_BLOCKS_ENABLED = false; // flip to true to re-enable Vault blocks for General
 const HOURLY_RESTART_ENABLED = String(HOURLY_RESTART ?? "0").trim() === "1";
 const HOURLY_RESTART_INTERVAL_MINUTES = Math.max(1, Number(HOURLY_RESTART_MINUTES ?? "60") || 60);
 const HOURLY_RESTART_MS = HOURLY_RESTART_INTERVAL_MINUTES * 60 * 1000;
@@ -607,7 +608,7 @@ function hasUserRecord(userId) {
 // TIME HELPERS (USER LOCAL CALENDAR via OFFSET or IANA)
 // =====================
 const DAY_MS = 24 * 60 * 60 * 1000;
-const TW_ANCHOR_UTC_MS = Date.UTC(2026, 1, 3, 0, 0, 0, 0); // Tue Feb 3, 2026
+const TW_ANCHOR_UTC_MS = Date.UTC(2026, 2, 24, 0, 0, 0, 0); // Tue Mar 24, 2026
 const TW_INTERVAL_DAYS = 14;
 const VAULT_ANCHOR_UTC_MS = Date.UTC(2026, 0, 31, 0, 0, 0, 0); // Sat Jan 31, 2026
 const VAULT_INTERVAL_DAYS = 14;
@@ -676,6 +677,7 @@ function isTempleWarsBlockedAtUtcMs(utcMs) {
 
 function isVaultBlockedAtUtcMsForTitle(utcMs, title) {
   if (!BLOCKS_ENABLED) return false;
+  if (!VAULT_BLOCKS_ENABLED) return false;
   if (String(title || "").toLowerCase() !== "general") return false;
   if (!Number.isFinite(utcMs)) return false;
 

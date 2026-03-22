@@ -12,7 +12,7 @@ git pull origin main
 pm2 restart FormBot-1068 --update-env
 
 #Update here#
-cd /home/matthew/Documents/FormBot-1068
+cd /home/matthew/Documents/Bots/FormBot_1068
 git add .
 git commit -m "Update bot code"
 git push origin main
