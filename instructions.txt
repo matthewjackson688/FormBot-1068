@@ -1,4 +1,4 @@
-ssh -i "/home/matthew/Documents/Bots/FormBot_1068/1068.key" ubuntu@132.145.49.38
+sudo ssh -i "/home/matthew/Documents/Bots/FormBot-1068/1068.key" ubuntu@132.145.49.38
 
 #open repo#
 cd /home/matthew/Documents
